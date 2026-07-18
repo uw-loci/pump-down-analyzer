@@ -1,0 +1,931 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pump-Down Pressure Viewer</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --background: #f7f9fb;
+      --foreground: #17212b;
+      --card: #ffffff;
+      --card-foreground: #17212b;
+      --muted: #e8edf2;
+      --muted-foreground: #52606d;
+      --border: #cbd5df;
+      --input: #ffffff;
+      --primary: #18324a;
+      --primary-foreground: #ffffff;
+      --accent: #dcecf8;
+      --accent-foreground: #18324a;
+      --destructive: #a62b2b;
+      --series-pressure: #2d6fa3;
+      --series-active: #2f8a4b;
+      --series-inactive: #89939c;
+      --series-warning: #c47f14;
+      --series-critical: #b64040;
+      --series-status: #7656a8;
+      --series-note: #167a75;
+      --font-size-base: 14px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --background: #111820;
+        --foreground: #e8eef4;
+        --card: #18222d;
+        --card-foreground: #e8eef4;
+        --muted: #263340;
+        --muted-foreground: #b5c1cd;
+        --border: #40505f;
+        --input: #18222d;
+        --primary: #dcecf8;
+        --primary-foreground: #13202b;
+        --accent: #2a4257;
+        --accent-foreground: #eff7fc;
+        --destructive: #ff8b8b;
+        --series-pressure: #73b7e8;
+        --series-active: #67c681;
+        --series-inactive: #83909c;
+        --series-warning: #f0b44b;
+        --series-critical: #ff8585;
+        --series-status: #bc9aec;
+        --series-note: #62c9c1;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--background);
+      color: var(--foreground);
+      font: 400 var(--font-size-base)/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    button, input, select, textarea { font: inherit; }
+    button, select, input, textarea {
+      color: var(--foreground);
+      background: var(--input);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    button {
+      padding: 0.48rem 0.72rem;
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent); color: var(--accent-foreground); }
+    button[aria-pressed="true"], .primary {
+      background: var(--primary);
+      color: var(--primary-foreground);
+      border-color: var(--primary);
+    }
+    button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
+      outline: 2px solid var(--series-pressure);
+      outline-offset: 2px;
+    }
+    #pumpdown-viewer {
+      width: min(1500px, 100%);
+      margin: 0 auto;
+      padding: 1rem clamp(0.65rem, 2vw, 1.5rem) 2rem;
+    }
+    header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-bottom: 0.75rem;
+    }
+    h1 { font-size: 1.35rem; font-weight: 500; margin: 0; }
+    h2 { font-size: 1.05rem; font-weight: 500; margin: 1.25rem 0 0.55rem; }
+    .muted { color: var(--muted-foreground); }
+    .small { font-size: 0.85rem; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 0.7rem;
+      margin-bottom: 0.75rem;
+    }
+    .stat {
+      background: var(--card);
+      color: var(--card-foreground);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.7rem 0.85rem;
+    }
+    .stat-label { color: var(--muted-foreground); font-size: 0.82rem; }
+    .stat-value { font-size: 1.18rem; font-weight: 500; margin-top: 0.15rem; }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: end;
+      margin: 0.6rem 0;
+    }
+    .field { display: grid; gap: 0.2rem; }
+    .field label { font-size: 0.8rem; color: var(--muted-foreground); }
+    select, input, textarea { padding: 0.45rem 0.55rem; }
+    #chart-wrap {
+      position: relative;
+      width: 100%;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    #pumpdown-chart {
+      display: block;
+      width: 100%;
+      height: auto;
+      min-height: 420px;
+      touch-action: none;
+      user-select: none;
+    }
+    #tooltip {
+      position: absolute;
+      display: none;
+      max-width: min(360px, 80%);
+      padding: 0.55rem 0.65rem;
+      color: var(--card-foreground);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      box-shadow: 0 5px 18px rgba(0, 0, 0, 0.2);
+      pointer-events: none;
+      z-index: 3;
+      font-size: 0.83rem;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.8rem;
+      align-items: center;
+      margin: 0.45rem 0 0.2rem;
+      font-size: 0.82rem;
+      color: var(--muted-foreground);
+    }
+    .swatch { display: inline-block; width: 1rem; height: 0.16rem; margin-right: 0.25rem; vertical-align: middle; }
+    .status { min-height: 1.3rem; margin-top: 0.35rem; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; background: transparent; }
+    th, td { padding: 0.48rem 0.55rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { font-weight: 500; color: var(--muted-foreground); }
+    td.actions { white-space: nowrap; }
+    .empty { color: var(--muted-foreground); padding: 0.8rem 0; }
+    dialog {
+      color: var(--card-foreground);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      width: min(560px, calc(100% - 2rem));
+      padding: 0;
+    }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+    dialog form { display: grid; gap: 0.75rem; padding: 1rem; }
+    dialog h2 { margin: 0; }
+    dialog textarea { min-height: 7rem; resize: vertical; }
+    .dialog-actions { display: flex; justify-content: space-between; gap: 0.5rem; flex-wrap: wrap; }
+    .right-actions { display: flex; gap: 0.5rem; margin-left: auto; }
+    .danger { color: var(--destructive); }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    @media (max-width: 720px) {
+      .stats { grid-template-columns: 1fr; }
+      #pumpdown-chart { min-height: 360px; }
+      .controls > * { flex: 1 1 auto; }
+      .controls button { white-space: nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <div id="pumpdown-viewer">
+    <header>
+      <h1>Pump-Down Pressure Viewer</h1>
+      <div class="muted small" id="source-name"></div>
+    </header>
+
+    <div class="stats" aria-label="Run summary">
+      <div class="stat"><div class="stat-label">Pressure samples</div><div class="stat-value" id="sample-count"></div></div>
+      <div class="stat"><div class="stat-label">Minimum pressure</div><div class="stat-value" id="minimum-pressure"></div></div>
+      <div class="stat"><div class="stat-label">History span</div><div class="stat-value" id="history-span"></div></div>
+    </div>
+
+    <div class="controls" aria-label="Plot controls">
+      <div class="field">
+        <label for="scale-select">Pressure scale</label>
+        <select id="scale-select"><option value="log">Logarithmic</option><option value="linear">Linear</option></select>
+      </div>
+      <div class="field">
+        <label for="time-select">Time labels</label>
+        <select id="time-select"><option value="clock">Local clock</option><option value="elapsed">Elapsed</option></select>
+      </div>
+      <button type="button" id="pan-mode" aria-pressed="true">Pan</button>
+      <button type="button" id="point-mode" aria-pressed="false">Add point note</button>
+      <button type="button" id="range-mode" aria-pressed="false">Add range note</button>
+      <button type="button" id="reset-view">Reset view</button>
+      <button type="button" id="save-html">Save annotated HTML</button>
+      <button type="button" id="export-package" class="primary">Export analysis package</button>
+      <button type="button" id="import-notes">Import notes</button>
+      <input type="file" id="import-file" accept="application/json,.json" hidden>
+    </div>
+
+    <div id="chart-wrap">
+      <svg id="pumpdown-chart" viewBox="0 0 1200 720" role="img" aria-labelledby="chart-title chart-description">
+        <title id="chart-title">Pressure history and named equipment-state timeline</title>
+        <desc id="chart-description">Interactive pressure history above eight aligned equipment-state lanes. Use the mouse wheel to zoom and drag to pan.</desc>
+      </svg>
+      <div id="tooltip" role="status" aria-live="polite"></div>
+    </div>
+    <div class="legend" aria-label="Chart legend">
+      <span><span class="swatch" style="background:var(--series-pressure)"></span>Pressure</span>
+      <span><span class="swatch" style="background:var(--series-active)"></span>Active equipment interval</span>
+      <span><span class="swatch" style="background:var(--series-warning)"></span>Pressure rise/status event</span>
+      <span><span class="swatch" style="background:var(--series-critical)"></span>Interlock/data issue</span>
+      <span><span class="swatch" style="background:var(--series-note)"></span>Manual annotation</span>
+    </div>
+    <div class="muted small">Wheel to zoom, drag to pan, double-click to reset. Point notes snap to the nearest pressure sample.</div>
+    <div class="status muted small" id="status-message" aria-live="polite"></div>
+
+    <h2>Manual annotations</h2>
+    <div class="table-wrap">
+      <table id="annotation-table">
+        <thead><tr><th>Type</th><th>Start</th><th>End</th><th>Category</th><th>Note</th><th></th></tr></thead>
+        <tbody id="annotation-body"></tbody>
+      </table>
+      <div class="empty" id="annotation-empty">No manual annotations yet.</div>
+    </div>
+  </div>
+
+  <dialog id="note-dialog">
+    <form id="note-form">
+      <h2 id="dialog-title">Add annotation</h2>
+      <input type="hidden" id="note-id">
+      <input type="hidden" id="note-kind">
+      <div class="field"><label for="note-start">Start time</label><input type="datetime-local" id="note-start" step="1" required></div>
+      <div class="field" id="note-end-field"><label for="note-end">End time</label><input type="datetime-local" id="note-end" step="1"></div>
+      <div class="field">
+        <label for="note-category">Category</label>
+        <select id="note-category">
+          <option>Operator action</option>
+          <option>Equipment change</option>
+          <option selected>Observation</option>
+          <option>Suspected issue</option>
+          <option>Other</option>
+        </select>
+      </div>
+      <div class="field"><label for="note-text">What happened?</label><textarea id="note-text" required></textarea></div>
+      <div class="dialog-actions">
+        <button type="button" id="delete-note" class="danger" hidden>Delete</button>
+        <div class="right-actions"><button type="button" id="cancel-note">Cancel</button><button type="submit" class="primary">Save note</button></div>
+      </div>
+    </form>
+  </dialog>
+
+  <script id="pumpdown-data" type="application/json">__PUMPDOWN_DATA_JSON__</script>
+  <script id="annotation-data" type="application/json">__PUMPDOWN_ANNOTATIONS_JSON__</script>
+  <script>
+  (() => {
+    "use strict";
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const DATA = JSON.parse(document.getElementById("pumpdown-data").textContent);
+    let annotations = JSON.parse(document.getElementById("annotation-data").textContent || "[]");
+    const svg = document.getElementById("pumpdown-chart");
+    const wrap = document.getElementById("chart-wrap");
+    const tooltip = document.getElementById("tooltip");
+    const statusMessage = document.getElementById("status-message");
+    const W = 1200, H = 720, LEFT = 190, RIGHT = 32, PRESSURE_TOP = 34, PRESSURE_BOTTOM = 398;
+    const STATES_TOP = 440, LANE_HEIGHT = 28, AXIS_Y = 688;
+    const PLOT_WIDTH = W - LEFT - RIGHT;
+    const duration = Math.max(1, Number(DATA.duration_seconds));
+    const startDate = new Date(DATA.start_timestamp_local);
+    const view = { x0: 0, x1: duration, scale: "log", timeMode: "clock", mode: "pan", drag: null };
+    const css = getComputedStyle(document.documentElement);
+
+    const colors = () => ({
+      foreground: css.getPropertyValue("--foreground").trim(),
+      muted: css.getPropertyValue("--muted-foreground").trim(),
+      border: css.getPropertyValue("--border").trim(),
+      card: css.getPropertyValue("--card").trim(),
+      pressure: css.getPropertyValue("--series-pressure").trim(),
+      active: css.getPropertyValue("--series-active").trim(),
+      inactive: css.getPropertyValue("--series-inactive").trim(),
+      warning: css.getPropertyValue("--series-warning").trim(),
+      critical: css.getPropertyValue("--series-critical").trim(),
+      status: css.getPropertyValue("--series-status").trim(),
+      note: css.getPropertyValue("--series-note").trim(),
+      accent: css.getPropertyValue("--accent").trim(),
+    });
+
+    function element(name, attrs = {}, text = null) {
+      const node = document.createElementNS(SVG_NS, name);
+      Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, String(value)));
+      if (text !== null) node.textContent = text;
+      return node;
+    }
+
+    function add(parent, name, attrs = {}, text = null) {
+      const node = element(name, attrs, text);
+      parent.appendChild(node);
+      return node;
+    }
+
+    function pad(value) { return String(value).padStart(2, "0"); }
+
+    function isoAt(elapsed) {
+      const stamp = new Date(startDate.getTime() + elapsed * 1000);
+      return `${stamp.getFullYear()}-${pad(stamp.getMonth() + 1)}-${pad(stamp.getDate())}` +
+        `T${pad(stamp.getHours())}:${pad(stamp.getMinutes())}:${pad(stamp.getSeconds())}`;
+    }
+
+    function elapsedFromIso(value) {
+      return (new Date(value).getTime() - startDate.getTime()) / 1000;
+    }
+
+    function formatElapsed(seconds) {
+      const sign = seconds < 0 ? "−" : "";
+      let whole = Math.round(Math.abs(seconds));
+      const hours = Math.floor(whole / 3600); whole %= 3600;
+      const minutes = Math.floor(whole / 60); const secs = whole % 60;
+      return `${sign}${hours}:${pad(minutes)}:${pad(secs)}`;
+    }
+
+    function formatClock(seconds) {
+      return isoAt(seconds).replace("T", " ").slice(11);
+    }
+
+    function formatPressure(value) {
+      if (value === null || value === undefined || !Number.isFinite(Number(value))) return "";
+      return Number(value).toExponential(3).replace("e", "E");
+    }
+
+    function lowerBound(timeValue) {
+      const rows = DATA.readings;
+      let low = 0, high = rows.length;
+      while (low < high) {
+        const mid = (low + high) >> 1;
+        if (rows[mid][0] < timeValue) low = mid + 1; else high = mid;
+      }
+      return low;
+    }
+
+    function nearestReading(timeValue) {
+      const pos = lowerBound(timeValue);
+      const candidates = [];
+      if (pos < DATA.readings.length) candidates.push(pos);
+      if (pos > 0) candidates.push(pos - 1);
+      const index = candidates.reduce((best, current) =>
+        best === null || Math.abs(DATA.readings[current][0] - timeValue) < Math.abs(DATA.readings[best][0] - timeValue) ? current : best, null);
+      return index === null ? null : { index, row: DATA.readings[index] };
+    }
+
+    function activeStateIndexesAt(timeValue) {
+      const active = new Set();
+      for (const [stateIndex, start, end] of DATA.active_state_intervals) {
+        if (timeValue >= start && (timeValue < end || (timeValue === duration && end === duration))) active.add(stateIndex);
+      }
+      return active;
+    }
+
+    function xFor(timeValue) { return LEFT + ((timeValue - view.x0) / (view.x1 - view.x0)) * PLOT_WIDTH; }
+    function timeForX(x) { return view.x0 + ((x - LEFT) / PLOT_WIDTH) * (view.x1 - view.x0); }
+
+    function clampView() {
+      let span = view.x1 - view.x0;
+      span = Math.min(duration, Math.max(1, span));
+      if (view.x0 < 0) { view.x1 -= view.x0; view.x0 = 0; }
+      if (view.x1 > duration) { const excess = view.x1 - duration; view.x0 -= excess; view.x1 = duration; }
+      if (view.x0 < 0 || span >= duration) { view.x0 = 0; view.x1 = duration; }
+    }
+
+    function visibleReadings() {
+      const start = Math.max(0, lowerBound(view.x0) - 1);
+      const end = Math.min(DATA.readings.length, lowerBound(view.x1) + 1);
+      return DATA.readings.slice(start, end).map((row, offset) => ({ row, index: start + offset }));
+    }
+
+    function sampledVisibleReadings() {
+      const visible = visibleReadings();
+      const limit = Math.max(800, Math.floor(PLOT_WIDTH * 2));
+      if (visible.length <= limit) return visible;
+      const buckets = new Map();
+      for (const item of visible) {
+        const pixel = Math.max(0, Math.min(Math.floor(PLOT_WIDTH), Math.floor(xFor(item.row[0]) - LEFT)));
+        let bucket = buckets.get(pixel);
+        if (!bucket) {
+          bucket = { first: item, last: item, min: item, max: item };
+          buckets.set(pixel, bucket);
+        } else {
+          bucket.last = item;
+          if (item.row[1] < bucket.min.row[1]) bucket.min = item;
+          if (item.row[1] > bucket.max.row[1]) bucket.max = item;
+        }
+      }
+      const selected = new Map();
+      for (const bucket of buckets.values()) {
+        [bucket.first, bucket.min, bucket.max, bucket.last].forEach(item => selected.set(item.index, item));
+      }
+      return [...selected.values()].sort((a, b) => a.index - b.index);
+    }
+
+    function calculateY() {
+      const visible = visibleReadings().map(item => item.row[1]).filter(value => Number.isFinite(value) && value > 0);
+      const values = visible.length ? visible : DATA.readings.map(row => row[1]).filter(value => value > 0);
+      let min = Math.min(...values), max = Math.max(...values);
+      if (view.scale === "log") {
+        let lo = Math.floor(Math.log10(min));
+        let hi = Math.ceil(Math.log10(max));
+        if (lo === hi) hi += 1;
+        const map = value => PRESSURE_BOTTOM - ((Math.log10(value) - lo) / (hi - lo)) * (PRESSURE_BOTTOM - PRESSURE_TOP);
+        const ticks = [];
+        for (let exponent = lo; exponent <= hi; exponent++) ticks.push({ value: 10 ** exponent, label: `1E${exponent >= 0 ? "+" : ""}${exponent}` });
+        return { map, ticks };
+      }
+      const padding = (max - min || Math.abs(max) || 1) * 0.06;
+      min = Math.max(0, min - padding); max += padding;
+      const map = value => PRESSURE_BOTTOM - ((value - min) / (max - min)) * (PRESSURE_BOTTOM - PRESSURE_TOP);
+      const ticks = [];
+      for (let index = 0; index <= 5; index++) {
+        const value = min + ((max - min) * index) / 5;
+        ticks.push({ value, label: formatPressure(value) });
+      }
+      return { map, ticks };
+    }
+
+    function eventColor(event, palette) {
+      if (event.category === "Major pressure rise" || event.category === "Pressure status") return palette.warning;
+      if (event.category === "Vacuum interlock" || event.category === "Pressure data gap" || event.category === "VTRX/data") return palette.critical;
+      return palette.status;
+    }
+
+    function render() {
+      const palette = colors();
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      add(svg, "title", { id: "chart-title" }, "Pressure history and named equipment-state timeline");
+      add(svg, "desc", { id: "chart-description" }, "Interactive pressure history above eight aligned named equipment-state lanes.");
+      const defs = add(svg, "defs");
+      const clip = add(defs, "clipPath", { id: "pressure-clip" });
+      add(clip, "rect", { x: LEFT, y: PRESSURE_TOP, width: PLOT_WIDTH, height: PRESSURE_BOTTOM - PRESSURE_TOP });
+
+      add(svg, "rect", { x: 0, y: 0, width: W, height: H, fill: palette.card });
+      const y = calculateY();
+      for (const tick of y.ticks) {
+        const yy = y.map(tick.value);
+        if (!Number.isFinite(yy) || yy < PRESSURE_TOP - 1 || yy > PRESSURE_BOTTOM + 1) continue;
+        add(svg, "line", { x1: LEFT, x2: W - RIGHT, y1: yy, y2: yy, stroke: palette.border, "stroke-width": 1 });
+        add(svg, "text", { x: LEFT - 10, y: yy + 4, fill: palette.muted, "text-anchor": "end", "font-size": 12 }, tick.label);
+      }
+      add(svg, "text", { x: 20, y: PRESSURE_TOP + 12, fill: palette.foreground, "font-size": 13, "font-weight": 500 }, "Pressure (mbar)");
+
+      const xTickCount = 8;
+      for (let index = 0; index <= xTickCount; index++) {
+        const value = view.x0 + ((view.x1 - view.x0) * index) / xTickCount;
+        const xx = xFor(value);
+        add(svg, "line", { x1: xx, x2: xx, y1: PRESSURE_TOP, y2: AXIS_Y, stroke: palette.border, "stroke-width": 0.75 });
+        const label = view.timeMode === "elapsed" ? formatElapsed(value) : formatClock(value);
+        add(svg, "text", { x: xx, y: AXIS_Y + 20, fill: palette.muted, "text-anchor": "middle", "font-size": 12 }, label);
+      }
+
+      const eventLayer = add(svg, "g", { "clip-path": "url(#pressure-clip)" });
+      for (const event of DATA.events) {
+        if (event.category === "Equipment state" || event.t < view.x0 || event.t > view.x1) continue;
+        const xx = xFor(event.t), color = eventColor(event, palette);
+        add(eventLayer, "line", { x1: xx, x2: xx, y1: PRESSURE_TOP, y2: PRESSURE_BOTTOM, stroke: color, "stroke-width": event.category === "Major pressure rise" ? 2 : 1, "stroke-opacity": event.category === "Major pressure rise" ? 0.75 : 0.28, "stroke-dasharray": "4 4" });
+        add(eventLayer, "path", { d: `M ${xx - 5} ${PRESSURE_TOP + 2} L ${xx + 5} ${PRESSURE_TOP + 2} L ${xx} ${PRESSURE_TOP + 10} Z`, fill: color });
+      }
+
+      const pressurePoints = sampledVisibleReadings();
+      let path = "", previous = null;
+      for (const item of pressurePoints) {
+        const [timeValue, pressure] = item.row;
+        const yy = y.map(pressure), xx = xFor(timeValue);
+        if (!Number.isFinite(yy)) continue;
+        const breakPath = previous === null || timeValue - previous > 5;
+        path += `${breakPath ? "M" : "L"}${xx.toFixed(2)},${yy.toFixed(2)} `;
+        previous = timeValue;
+      }
+      add(svg, "path", { d: path.trim(), fill: "none", stroke: palette.pressure, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round", "clip-path": "url(#pressure-clip)" });
+      add(svg, "line", { x1: LEFT, x2: W - RIGHT, y1: PRESSURE_BOTTOM, y2: PRESSURE_BOTTOM, stroke: palette.foreground, "stroke-width": 1 });
+
+      add(svg, "text", { x: 20, y: STATES_TOP - 13, fill: palette.foreground, "font-size": 13, "font-weight": 500 }, "Named equipment states");
+      DATA.state_names.forEach((name, stateIndex) => {
+        const top = STATES_TOP + stateIndex * LANE_HEIGHT;
+        const middle = top + LANE_HEIGHT / 2;
+        add(svg, "rect", { x: LEFT, y: top + 2, width: PLOT_WIDTH, height: LANE_HEIGHT - 5, fill: palette.card, stroke: palette.border, "stroke-width": 0.6 });
+        add(svg, "text", { x: LEFT - 10, y: middle + 4, fill: palette.foreground, "text-anchor": "end", "font-size": 12 }, name);
+        for (const [intervalState, start, end] of DATA.active_state_intervals) {
+          if (intervalState !== stateIndex || end < view.x0 || start > view.x1) continue;
+          const clippedStart = Math.max(start, view.x0), clippedEnd = Math.min(end, view.x1);
+          add(svg, "rect", { x: xFor(clippedStart), y: top + 4, width: Math.max(1, xFor(clippedEnd) - xFor(clippedStart)), height: LANE_HEIGHT - 9, fill: palette.active, "fill-opacity": 0.78 });
+        }
+        for (const [timeValue, changeState, active] of DATA.state_changes) {
+          if (changeState !== stateIndex || timeValue < view.x0 || timeValue > view.x1) continue;
+          add(svg, "circle", { cx: xFor(timeValue), cy: middle, r: 4.2, fill: active ? palette.active : palette.card, stroke: active ? palette.active : palette.inactive, "stroke-width": 2 });
+        }
+      });
+
+      const annotationLayer = add(svg, "g");
+      for (const annotation of annotations) {
+        const start = elapsedFromIso(annotation.start_timestamp_local);
+        const end = annotation.end_timestamp_local ? elapsedFromIso(annotation.end_timestamp_local) : start;
+        if (end < view.x0 || start > view.x1) continue;
+        const x0 = xFor(Math.max(start, view.x0));
+        if (annotation.kind === "range") {
+          const x1 = xFor(Math.min(end, view.x1));
+          add(annotationLayer, "rect", { x: x0, y: PRESSURE_TOP, width: Math.max(1, x1 - x0), height: PRESSURE_BOTTOM - PRESSURE_TOP, fill: palette.note, "fill-opacity": 0.12, stroke: palette.note, "stroke-width": 1 });
+          add(annotationLayer, "text", { x: x0 + 5, y: PRESSURE_TOP + 28, fill: palette.foreground, "font-size": 12 }, annotation.note.slice(0, 44));
+        } else {
+          add(annotationLayer, "line", { x1: x0, x2: x0, y1: PRESSURE_TOP, y2: PRESSURE_BOTTOM, stroke: palette.note, "stroke-width": 2 });
+          add(annotationLayer, "text", { x: x0 + 5, y: PRESSURE_TOP + 18, fill: palette.foreground, "font-size": 12 }, annotation.note.slice(0, 44));
+        }
+      }
+
+      if (view.drag && view.mode === "range" && view.drag.currentTime !== undefined) {
+        const a = xFor(Math.max(view.x0, Math.min(view.drag.startTime, view.drag.currentTime)));
+        const b = xFor(Math.min(view.x1, Math.max(view.drag.startTime, view.drag.currentTime)));
+        add(svg, "rect", { x: a, y: PRESSURE_TOP, width: Math.max(1, b - a), height: PRESSURE_BOTTOM - PRESSURE_TOP, fill: palette.accent, "fill-opacity": 0.45, stroke: palette.note, "stroke-width": 1 });
+      }
+
+      add(svg, "line", { x1: LEFT, x2: W - RIGHT, y1: AXIS_Y, y2: AXIS_Y, stroke: palette.foreground, "stroke-width": 1 });
+      renderAnnotationTable();
+    }
+
+    function chartCoordinates(event) {
+      const rect = svg.getBoundingClientRect();
+      return { x: ((event.clientX - rect.left) / rect.width) * W, y: ((event.clientY - rect.top) / rect.height) * H, rect };
+    }
+
+    function showTooltip(event, x) {
+      if (x < LEFT || x > W - RIGHT) { tooltip.style.display = "none"; return; }
+      const timeValue = Math.max(0, Math.min(duration, timeForX(x)));
+      const nearest = nearestReading(timeValue);
+      if (!nearest) return;
+      const [sampleTime, pressure] = nearest.row;
+      const active = [...activeStateIndexesAt(sampleTime)].map(index => DATA.state_names[index]);
+      const nearbyEvents = DATA.events.filter(item => Math.abs(item.t - sampleTime) <= 1.0).slice(0, 4);
+      const timeLabel = `${isoAt(sampleTime).replace("T", " ")} (${formatElapsed(sampleTime)} elapsed)`;
+      const eventText = nearbyEvents.length ? `<br><b>Events:</b> ${nearbyEvents.map(item => escapeHtml(item.message)).join("; ")}` : "";
+      tooltip.innerHTML = `<b>${timeLabel}</b><br>Pressure: ${formatPressure(pressure)} mbar` +
+        `<br><b>Active:</b> ${active.length ? active.map(escapeHtml).join(", ") : "None"}${eventText}`;
+      const wrapRect = wrap.getBoundingClientRect();
+      const left = Math.min(wrapRect.width - 370, Math.max(8, event.clientX - wrapRect.left + 12));
+      const top = Math.max(8, event.clientY - wrapRect.top - tooltip.offsetHeight - 16);
+      tooltip.style.left = `${left}px`; tooltip.style.top = `${top}px`; tooltip.style.display = "block";
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[character]);
+    }
+
+    svg.addEventListener("wheel", event => {
+      event.preventDefault();
+      const point = chartCoordinates(event);
+      if (point.x < LEFT || point.x > W - RIGHT) return;
+      const center = timeForX(point.x);
+      const oldSpan = view.x1 - view.x0;
+      const newSpan = Math.max(1, Math.min(duration, oldSpan * Math.exp(event.deltaY * 0.0015)));
+      const ratio = (center - view.x0) / oldSpan;
+      view.x0 = center - newSpan * ratio; view.x1 = view.x0 + newSpan;
+      clampView(); render();
+    }, { passive: false });
+
+    svg.addEventListener("pointerdown", event => {
+      const point = chartCoordinates(event);
+      if (point.x < LEFT || point.x > W - RIGHT) return;
+      svg.setPointerCapture(event.pointerId);
+      const startTime = Math.max(0, Math.min(duration, timeForX(point.x)));
+      view.drag = { pointerId: event.pointerId, startClientX: event.clientX, originalX0: view.x0, originalX1: view.x1, startTime, currentTime: startTime };
+      tooltip.style.display = "none";
+    });
+
+    svg.addEventListener("pointermove", event => {
+      const point = chartCoordinates(event);
+      if (view.drag) {
+        if (view.mode === "pan") {
+          const span = view.drag.originalX1 - view.drag.originalX0;
+          const dx = ((event.clientX - view.drag.startClientX) / point.rect.width) * W;
+          const shift = -(dx / PLOT_WIDTH) * span;
+          view.x0 = view.drag.originalX0 + shift; view.x1 = view.drag.originalX1 + shift;
+          clampView(); render();
+        } else if (view.mode === "range") {
+          view.drag.currentTime = Math.max(0, Math.min(duration, timeForX(point.x)));
+          render();
+        }
+      } else {
+        showTooltip(event, point.x);
+      }
+    });
+
+    function finishPointer(event) {
+      if (!view.drag || view.drag.pointerId !== event.pointerId) return;
+      const drag = view.drag;
+      const point = chartCoordinates(event);
+      const endTime = Math.max(0, Math.min(duration, timeForX(Math.max(LEFT, Math.min(W - RIGHT, point.x)))));
+      view.drag = null;
+      if (view.mode === "point") {
+        const nearest = nearestReading(endTime);
+        if (nearest) openAnnotationDialog("point", nearest.row[0], null, null);
+      } else if (view.mode === "range") {
+        const start = Math.min(drag.startTime, endTime), end = Math.max(drag.startTime, endTime);
+        if (end - start >= 1) openAnnotationDialog("range", start, end, null);
+      }
+      render();
+    }
+    svg.addEventListener("pointerup", finishPointer);
+    svg.addEventListener("pointercancel", finishPointer);
+    svg.addEventListener("pointerleave", () => { if (!view.drag) tooltip.style.display = "none"; });
+    svg.addEventListener("dblclick", () => resetView());
+
+    function setMode(mode) {
+      view.mode = mode;
+      [["pan-mode", "pan"], ["point-mode", "point"], ["range-mode", "range"]].forEach(([id, value]) =>
+        document.getElementById(id).setAttribute("aria-pressed", String(value === mode)));
+      statusMessage.textContent = mode === "pan" ? "Pan mode: drag the plot." : mode === "point" ? "Point-note mode: click the pressure plot." : "Range-note mode: drag across the pressure plot.";
+    }
+
+    function resetView() { view.x0 = 0; view.x1 = duration; clampView(); render(); }
+    document.getElementById("pan-mode").addEventListener("click", () => setMode("pan"));
+    document.getElementById("point-mode").addEventListener("click", () => setMode("point"));
+    document.getElementById("range-mode").addEventListener("click", () => setMode("range"));
+    document.getElementById("reset-view").addEventListener("click", resetView);
+    document.getElementById("scale-select").addEventListener("change", event => { view.scale = event.target.value; render(); });
+    document.getElementById("time-select").addEventListener("change", event => { view.timeMode = event.target.value; render(); });
+
+    const dialog = document.getElementById("note-dialog");
+    const noteForm = document.getElementById("note-form");
+    const noteId = document.getElementById("note-id");
+    const noteKind = document.getElementById("note-kind");
+    const noteStart = document.getElementById("note-start");
+    const noteEnd = document.getElementById("note-end");
+    const noteEndField = document.getElementById("note-end-field");
+    const noteCategory = document.getElementById("note-category");
+    const noteText = document.getElementById("note-text");
+    const deleteNote = document.getElementById("delete-note");
+
+    function openAnnotationDialog(kind, start, end, existing) {
+      noteId.value = existing ? existing.id : "";
+      noteKind.value = kind;
+      noteStart.value = existing ? existing.start_timestamp_local : isoAt(start);
+      noteEnd.value = existing && existing.end_timestamp_local ? existing.end_timestamp_local : end === null ? "" : isoAt(end);
+      noteEndField.hidden = kind !== "range";
+      noteEnd.required = kind === "range";
+      noteCategory.value = existing ? existing.category : "Observation";
+      noteText.value = existing ? existing.note : "";
+      deleteNote.hidden = !existing;
+      document.getElementById("dialog-title").textContent = existing ? "Edit annotation" : `Add ${kind} annotation`;
+      dialog.showModal();
+      noteText.focus();
+    }
+
+    document.getElementById("cancel-note").addEventListener("click", () => dialog.close());
+    deleteNote.addEventListener("click", () => {
+      annotations = annotations.filter(item => item.id !== noteId.value);
+      dialog.close(); render(); statusMessage.textContent = "Annotation deleted. Save or export to persist the change.";
+    });
+    noteForm.addEventListener("submit", event => {
+      event.preventDefault();
+      const kind = noteKind.value;
+      let start = noteStart.value, end = kind === "range" ? noteEnd.value : null;
+      if (!start || (kind === "range" && !end) || !noteText.value.trim()) return;
+      if (end && new Date(end) < new Date(start)) [start, end] = [end, start];
+      const record = {
+        id: noteId.value || `N-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+        kind,
+        start_timestamp_local: start,
+        end_timestamp_local: end,
+        category: noteCategory.value,
+        note: noteText.value.trim(),
+      };
+      const position = annotations.findIndex(item => item.id === record.id);
+      if (position >= 0) annotations[position] = record; else annotations.push(record);
+      annotations.sort((a, b) => new Date(a.start_timestamp_local) - new Date(b.start_timestamp_local));
+      dialog.close(); render(); statusMessage.textContent = "Annotation updated. Save or export to persist the change.";
+    });
+
+    function renderAnnotationTable() {
+      const body = document.getElementById("annotation-body");
+      body.replaceChildren();
+      document.getElementById("annotation-empty").hidden = annotations.length > 0;
+      document.getElementById("annotation-table").hidden = annotations.length === 0;
+      for (const annotation of annotations) {
+        const row = document.createElement("tr");
+        [annotation.kind, annotation.start_timestamp_local.replace("T", " "), annotation.end_timestamp_local ? annotation.end_timestamp_local.replace("T", " ") : "", annotation.category, annotation.note].forEach(value => {
+          const cell = document.createElement("td"); cell.textContent = value; row.appendChild(cell);
+        });
+        const actionCell = document.createElement("td"); actionCell.className = "actions";
+        const edit = document.createElement("button"); edit.type = "button"; edit.textContent = "Edit";
+        edit.addEventListener("click", () => openAnnotationDialog(annotation.kind, null, null, annotation));
+        actionCell.appendChild(edit); row.appendChild(actionCell); body.appendChild(row);
+      }
+    }
+
+    function normalizedAnnotationPayload() {
+      return {
+        schema_version: 1,
+        source_name: DATA.source_name,
+        source_log_sha256: DATA.source_log_sha256,
+        exported_at: new Date().toISOString(),
+        annotations,
+      };
+    }
+
+    function cleanAnnotatedHtml() {
+      const clone = document.documentElement.cloneNode(true);
+      const encoded = JSON.stringify(annotations).replace(/</g, "\\u003c");
+      clone.querySelector("#annotation-data").textContent = encoded;
+      clone.querySelector("#pumpdown-chart").replaceChildren();
+      clone.querySelector("#annotation-body").replaceChildren();
+      clone.querySelector("#tooltip").replaceChildren();
+      clone.querySelector("#note-dialog").removeAttribute("open");
+      clone.querySelector("#import-file").value = "";
+      return `<!doctype html>\n${clone.outerHTML}`;
+    }
+
+    function downloadBlob(blob, filename) {
+      const link = document.createElement("a");
+      const url = URL.createObjectURL(blob);
+      link.href = url; link.download = filename; document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    document.getElementById("save-html").addEventListener("click", () => {
+      downloadBlob(new Blob([cleanAnnotatedHtml()], { type: "text/html;charset=utf-8" }), `${DATA.source_stem}_annotated_viewer.html`);
+      statusMessage.textContent = "Annotated HTML saved as a new file.";
+    });
+
+    document.getElementById("import-notes").addEventListener("click", () => document.getElementById("import-file").click());
+    document.getElementById("import-file").addEventListener("change", async event => {
+      const file = event.target.files[0]; if (!file) return;
+      try {
+        const payload = JSON.parse(await file.text());
+        const records = Array.isArray(payload) ? payload : payload.annotations;
+        if (!Array.isArray(records)) throw new Error("No annotations array found");
+        if (payload.source_log_sha256 && payload.source_log_sha256 !== DATA.source_log_sha256 && !confirm("These notes were created for a different log. Import anyway?")) return;
+        annotations = records.map((item, index) => ({
+          id: String(item.id || item.annotation_id || `imported-${index + 1}`),
+          kind: item.kind === "range" ? "range" : "point",
+          start_timestamp_local: item.start_timestamp_local || item.start_timestamp,
+          end_timestamp_local: item.end_timestamp_local || item.end_timestamp || null,
+          category: item.category || "Observation",
+          note: item.note || "",
+        }));
+        render(); statusMessage.textContent = `Imported ${annotations.length} annotation(s).`;
+      } catch (error) {
+        statusMessage.textContent = `Could not import notes: ${error.message}`;
+      } finally { event.target.value = ""; }
+    });
+
+    function csvCell(value) {
+      const text = value === null || value === undefined ? "" : String(value);
+      return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+    }
+    function csvLine(values) { return values.map(csvCell).join(",") + "\r\n"; }
+
+    function buildPressureCsv() {
+      const headers = ["sample_index", "timestamp_local", "elapsed_seconds", "pressure_mbar", "sample_in_second", "log_line_number", "quality_flag", "active_equipment_states", ...DATA.state_names];
+      let text = csvLine(headers);
+      DATA.readings.forEach((row, index) => {
+        const [elapsed, pressure] = row, meta = DATA.sample_meta[index] || ["", "", ""];
+        const active = activeStateIndexesAt(elapsed);
+        const labels = [...active].map(stateIndex => DATA.state_names[stateIndex]);
+        text += csvLine([index + 1, isoAt(elapsed), elapsed, formatPressure(pressure), meta[0], meta[1], meta[2], labels.join("; "), ...DATA.state_names.map((_, stateIndex) => active.has(stateIndex) ? "TRUE" : "FALSE")]);
+      });
+      return text;
+    }
+
+    function buildEquipmentCsv() {
+      let text = csvLine(["timestamp_local", "elapsed_seconds", "equipment_state", "status", "record_type", "source_line_number"]);
+      const initial = activeStateIndexesAt(0);
+      DATA.state_names.forEach((name, index) => { text += csvLine([isoAt(0), 0, name, initial.has(index) ? "Active" : "Inactive", "Initial state", ""]); });
+      DATA.state_changes.forEach(([elapsed, stateIndex, active, line]) => { text += csvLine([isoAt(elapsed), elapsed, DATA.state_names[stateIndex], active ? "Active" : "Inactive", "Transition", line || ""]); });
+      return text;
+    }
+
+    function buildEventsCsv() {
+      let text = csvLine(["event_id", "timestamp_local", "end_timestamp_local", "elapsed_seconds", "category", "equipment_state", "action", "level", "source", "message", "pressure_mbar_at_event", "log_line_number", "origin"]);
+      DATA.events.forEach(event => { text += csvLine([event.id, isoAt(event.t), event.t1 === null ? "" : isoAt(event.t1), event.t, event.category, event.state, event.action, event.level, event.source, event.message, formatPressure(event.pressure), event.line || "", event.origin]); });
+      annotations.forEach((item, index) => {
+        const elapsed = elapsedFromIso(item.start_timestamp_local), nearest = nearestReading(elapsed);
+        text += csvLine([`N${index + 1}`, item.start_timestamp_local, item.end_timestamp_local || "", elapsed, item.category, "", "", "NOTE", "Manual annotation", item.note, nearest ? formatPressure(nearest.row[1]) : "", "", "manual"]);
+      });
+      return text;
+    }
+
+    function buildAnnotationsCsv() {
+      let text = csvLine(["annotation_id", "type", "start_timestamp_local", "end_timestamp_local", "category", "note"]);
+      annotations.forEach(item => { text += csvLine([item.id, item.kind, item.start_timestamp_local, item.end_timestamp_local || "", item.category, item.note]); });
+      return text;
+    }
+
+    function resolveSvgColors(clone) {
+      const computed = getComputedStyle(document.documentElement);
+      clone.querySelectorAll("*").forEach(node => {
+        ["fill", "stroke", "color"].forEach(attribute => {
+          const value = node.getAttribute(attribute);
+          if (!value || !value.includes("var(")) return;
+          node.setAttribute(attribute, value.replace(/var\((--[^)]+)\)/g, (_, name) => computed.getPropertyValue(name).trim()));
+        });
+      });
+    }
+
+    async function chartPngBlob() {
+      const clone = svg.cloneNode(true);
+      clone.setAttribute("width", W); clone.setAttribute("height", H);
+      resolveSvgColors(clone);
+      const serialized = new XMLSerializer().serializeToString(clone);
+      const source = new Blob([serialized], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(source);
+      try {
+        const image = new Image();
+        await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = reject; image.src = url; });
+        const canvas = document.createElement("canvas"); canvas.width = W * 2; canvas.height = H * 2;
+        const context = canvas.getContext("2d");
+        context.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--card").trim();
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.scale(2, 2); context.drawImage(image, 0, 0, W, H);
+        return await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+      } finally { URL.revokeObjectURL(url); }
+    }
+
+    const crcTable = (() => {
+      const table = new Uint32Array(256);
+      for (let index = 0; index < 256; index++) {
+        let value = index;
+        for (let bit = 0; bit < 8; bit++) value = (value & 1) ? (0xEDB88320 ^ (value >>> 1)) : (value >>> 1);
+        table[index] = value >>> 0;
+      }
+      return table;
+    })();
+    function crc32(bytes) {
+      let value = 0xFFFFFFFF;
+      for (const byte of bytes) value = crcTable[(value ^ byte) & 0xFF] ^ (value >>> 8);
+      return (value ^ 0xFFFFFFFF) >>> 0;
+    }
+    function dosDateTime(stamp = new Date()) {
+      return {
+        time: ((stamp.getHours() & 31) << 11) | ((stamp.getMinutes() & 63) << 5) | ((Math.floor(stamp.getSeconds() / 2)) & 31),
+        date: (((stamp.getFullYear() - 1980) & 127) << 9) | (((stamp.getMonth() + 1) & 15) << 5) | (stamp.getDate() & 31),
+      };
+    }
+    function makeZip(entries) {
+      const encoder = new TextEncoder(), locals = [], centrals = [];
+      let offset = 0;
+      const stamp = dosDateTime();
+      for (const entry of entries) {
+        const name = encoder.encode(entry.name), data = entry.data instanceof Uint8Array ? entry.data : encoder.encode(entry.data);
+        const crc = crc32(data);
+        const local = new Uint8Array(30 + name.length + data.length), localView = new DataView(local.buffer);
+        localView.setUint32(0, 0x04034B50, true); localView.setUint16(4, 20, true); localView.setUint16(6, 0, true); localView.setUint16(8, 0, true);
+        localView.setUint16(10, stamp.time, true); localView.setUint16(12, stamp.date, true); localView.setUint32(14, crc, true);
+        localView.setUint32(18, data.length, true); localView.setUint32(22, data.length, true); localView.setUint16(26, name.length, true); localView.setUint16(28, 0, true);
+        local.set(name, 30); local.set(data, 30 + name.length); locals.push(local);
+        const central = new Uint8Array(46 + name.length), centralView = new DataView(central.buffer);
+        centralView.setUint32(0, 0x02014B50, true); centralView.setUint16(4, 20, true); centralView.setUint16(6, 20, true); centralView.setUint16(8, 0, true); centralView.setUint16(10, 0, true);
+        centralView.setUint16(12, stamp.time, true); centralView.setUint16(14, stamp.date, true); centralView.setUint32(16, crc, true);
+        centralView.setUint32(20, data.length, true); centralView.setUint32(24, data.length, true); centralView.setUint16(28, name.length, true);
+        centralView.setUint16(30, 0, true); centralView.setUint16(32, 0, true); centralView.setUint16(34, 0, true); centralView.setUint16(36, 0, true); centralView.setUint32(38, 0, true); centralView.setUint32(42, offset, true);
+        central.set(name, 46); centrals.push(central); offset += local.length;
+      }
+      const centralSize = centrals.reduce((sum, item) => sum + item.length, 0);
+      const end = new Uint8Array(22), endView = new DataView(end.buffer);
+      endView.setUint32(0, 0x06054B50, true); endView.setUint16(4, 0, true); endView.setUint16(6, 0, true); endView.setUint16(8, entries.length, true); endView.setUint16(10, entries.length, true);
+      endView.setUint32(12, centralSize, true); endView.setUint32(16, offset, true); endView.setUint16(20, 0, true);
+      return new Blob([...locals, ...centrals, end], { type: "application/zip" });
+    }
+
+    document.getElementById("export-package").addEventListener("click", async event => {
+      const button = event.currentTarget; button.disabled = true; statusMessage.textContent = "Building annotated analysis package…";
+      try {
+        const encoder = new TextEncoder(), png = await chartPngBlob();
+        const entries = [
+          { name: `${DATA.source_stem}_annotated_viewer.html`, data: encoder.encode(cleanAnnotatedHtml()) },
+          { name: `${DATA.source_stem}_annotated_plot.png`, data: new Uint8Array(await png.arrayBuffer()) },
+          { name: `${DATA.source_stem}_pressure.csv`, data: encoder.encode(buildPressureCsv()) },
+          { name: `${DATA.source_stem}_equipment_states.csv`, data: encoder.encode(buildEquipmentCsv()) },
+          { name: `${DATA.source_stem}_events.csv`, data: encoder.encode(buildEventsCsv()) },
+          { name: `${DATA.source_stem}_annotations.csv`, data: encoder.encode(buildAnnotationsCsv()) },
+          { name: `${DATA.source_stem}_annotations.json`, data: encoder.encode(JSON.stringify(normalizedAnnotationPayload(), null, 2)) },
+          { name: `${DATA.source_stem}_summary.md`, data: encoder.encode(DATA.summary_markdown) },
+        ];
+        downloadBlob(makeZip(entries), `${DATA.source_stem}_annotated_analysis.zip`);
+        statusMessage.textContent = "Analysis package exported.";
+      } catch (error) {
+        statusMessage.textContent = `Could not export package: ${error.message}`;
+      } finally { button.disabled = false; }
+    });
+
+    document.getElementById("source-name").textContent = DATA.source_name;
+    document.getElementById("sample-count").textContent = Number(DATA.reading_count).toLocaleString();
+    document.getElementById("minimum-pressure").textContent = `${formatPressure(DATA.minimum_pressure_mbar)} mbar`;
+    document.getElementById("history-span").textContent = formatElapsed(DATA.duration_seconds);
+    render();
+  })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local pump-down inputs and generated analysis artifacts
+inputs/*
+!inputs/README.md
+outputs/
+qa/
+*_annotated_analysis.zip
+*_annotated_viewer.html
+*_annotated_plot.png
+~$*.xlsx
+
+# Local editor, OS, and Codex workspace state
+.vscode/
+.idea/
+.agents/
+.codex/
+.DS_Store
+Thumbs.db
+desktop.ini
