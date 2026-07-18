@@ -24,7 +24,7 @@ class EquipmentStateTests(unittest.TestCase):
         active = {label for label, value in zip(analyzer.STATE_LABELS, states) if value}
         self.assertEqual(
             active,
-            {"Pumps Power ON", "972b Power ON", "Argon Gate OPEN"},
+            {"Pumps Power ON", "Relay 1 CLOSED", "Argon Gate OPEN"},
         )
 
     def test_short_values_are_normalized_to_eight_positions(self) -> None:
@@ -62,7 +62,7 @@ class RealLogTests(unittest.TestCase):
         signatures = {(event.timestamp.time().isoformat(), event.state_name, event.action) for event in transitions}
         self.assertIn(("18:11:06", "Pumps Power ON", "Deactivated"), signatures)
         self.assertIn(("18:12:09", "Turbo Vent OPEN", "Activated"), signatures)
-        self.assertIn(("19:28:22", "972b Power ON", "Activated"), signatures)
+        self.assertIn(("19:28:22", "Relay 1 CLOSED", "Activated"), signatures)
 
     def test_threshold_and_pressure_rise_detection(self) -> None:
         crossing = next(item for threshold, item in self.result.thresholds if math_close(threshold, 1e-4))

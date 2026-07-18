@@ -30,7 +30,7 @@ required_states = [
     "Pumps Power ON",
     "Turbo Rotor ON",
     "Turbo Vent OPEN",
-    "972b Power ON",
+    "Relay 1 CLOSED",
     "Turbo Gate CLOSED",
     "Turbo Gate OPEN",
     "Argon Gate OPEN",

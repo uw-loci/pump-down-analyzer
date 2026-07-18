@@ -149,6 +149,9 @@ Get-ChildItem .\inputs\log_*.txt | ForEach-Object {
   same displayed second retain their original sequence.
 - Each named equipment bit is treated as an independent indicator. The analyzer
   does not infer whether simultaneous OPEN/CLOSED feedback is mechanically valid.
+- Position 4 of the MSB-first VTRX state field is the 972B Relay 1 normally-open
+  contact feedback. A value of `1` means the contact is closed and is displayed
+  as `Relay 1 CLOSED`.
 - Threshold crossings, pressure-data gaps, rapid rises, and nearby named state
   changes are evidence for investigation, not automatic root-cause conclusions.
 - The current version analyzes one log at a time and does not modify the EBEAM

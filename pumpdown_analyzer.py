@@ -24,11 +24,13 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 
+# VTRX serializes these inputs MSB-first. Position 4 is connected through the
+# optocoupler to the 972B Relay 1 normally-open contact, so HIGH means closed.
 STATE_DEFINITIONS: tuple[tuple[str, str], ...] = (
     ("pumps_power_on", "Pumps Power ON"),
     ("turbo_rotor_on", "Turbo Rotor ON"),
     ("turbo_vent_open", "Turbo Vent OPEN"),
-    ("sensor_972b_power_on", "972b Power ON"),
+    ("relay_1_closed", "Relay 1 CLOSED"),
     ("turbo_gate_closed", "Turbo Gate CLOSED"),
     ("turbo_gate_open", "Turbo Gate OPEN"),
     ("argon_gate_open", "Argon Gate OPEN"),
