@@ -1,7 +1,8 @@
 # Pump-Down Analyzer
 
-Pump-Down Analyzer turns one EBEAM dashboard log into reusable pressure data,
-an Excel report, an anomaly summary, and a fully offline interactive viewer.
+Pump-Down Analyzer turns one EBEAM dashboard log—or a directory of chained logs
+from one experiment—into reusable pressure data, an Excel report, an anomaly
+summary, and a fully offline interactive viewer.
 
 It creates:
 
@@ -24,9 +25,10 @@ There is one intentional structural relationship: keep
 `viewer_template.html` beside `pumpdown_analyzer.py`. The analyzer finds the
 template relative to its own script file. Input logs may live anywhere.
 
-The default output location is `./outputs/<log-stem>/`, where `.` is the
-directory from which the command is run. Run commands from the repository root
-if you want all default outputs collected inside this repository.
+The default output location is `./outputs/<input-name>/`, where the input name
+is the file stem or experiment-directory name and `.` is the directory from
+which the command is run. Run commands from the repository root if you want all
+default outputs collected inside this repository.
 
 ## Repository layout
 
@@ -37,7 +39,7 @@ pump-down-analyzer/
 ├── requirements.txt          Runtime dependency
 ├── requirements-dev.txt      Optional workbook-verification dependency
 ├── inputs/                   Optional local log location; raw logs are ignored
-├── outputs/                  Generated per-log analyses; ignored by Git
+├── outputs/                  Generated per-input analyses; ignored by Git
 ├── tests/                    Unit and optional real-log regression tests
 └── tools/                    Optional artifact-validation utilities
 ```
@@ -83,6 +85,29 @@ it, the program refuses to replace files.
 
 Run `python .\pumpdown_analyzer.py --help` for the complete command reference.
 
+## Analyze chained logs as one experiment
+
+When the EBEAM dashboard rotates its log during one experiment, place all of
+that experiment's fragments in one directory and pass the directory itself:
+
+```powershell
+python .\pumpdown_analyzer.py ".\inputs\2026-07-21 pump down"
+```
+
+The analyzer non-recursively collects `log_*.txt` files whose names use
+`log_YYYY-MM-DD_HH-MM-SS.txt`, orders them by that timestamp, and produces one
+combined analysis under `outputs/2026-07-21 pump down/`. Other files in the
+directory are ignored.
+
+Experiment-wide elapsed time, same-second sample sequencing, equipment state,
+gap detection, and anomaly analysis continue across fragment boundaries. A
+fragment with no pressure samples is retained in the source manifest and does
+not prevent analysis as long as another fragment contains pressure data. True
+timestamp overlaps are rejected instead of being silently merged.
+
+`--date` is available only for single-file analysis. Chained files must carry
+their dates and start times in their filenames.
+
 ## Generated files
 
 For an input named `log_2026-08-03_09-15-00.txt`, the default output directory
@@ -124,14 +149,16 @@ To bring viewer notes back into a regenerated Excel workbook, extract the
 python .\pumpdown_analyzer.py .\inputs\log_2026-08-03_09-15-00.txt --annotations .\notes\log_2026-08-03_09-15-00_annotations.json --overwrite
 ```
 
-Annotation files include a hash of the source log. A mismatch is reported so
-notes are not silently associated with the wrong experiment.
+Annotation files include a source fingerprint: the raw log hash for one file or
+a stable fingerprint of the ordered content hashes for a chain. A mismatch is
+reported so notes are not silently associated with the wrong experiment.
 
-## Analyze multiple logs
+## Analyze multiple independent logs
 
-The analyzer handles one log per invocation. Timestamped EBEAM filenames create
-separate default output directories, so repeated experiments do not overwrite
-one another.
+Passing a directory chains its logs into one experiment. To analyze unrelated
+logs as separate experiments, invoke the analyzer once per file. Timestamped
+EBEAM filenames create separate default output directories, so repeated
+experiments do not overwrite one another.
 
 To process every matching local input in PowerShell:
 
@@ -147,6 +174,9 @@ Get-ChildItem .\inputs\log_*.txt | ForEach-Object {
   units remain in the dataset with a quality flag.
 - Logs spanning midnight are handled, and multiple pressure samples with the
   same displayed second retain their original sequence.
+- Chained logs are ordered from their filename timestamps. Last-known equipment
+  state is carried forward across boundaries, while source filename and line
+  number remain attached to every extracted record.
 - Each named equipment bit is treated as an independent indicator. The analyzer
   does not infer whether simultaneous OPEN/CLOSED feedback is mechanically valid.
 - Position 4 of the MSB-first VTRX state field is the 972B Relay 1 normally-open
@@ -154,8 +184,7 @@ Get-ChildItem .\inputs\log_*.txt | ForEach-Object {
   as `Relay 1 CLOSED`.
 - Threshold crossings, pressure-data gaps, rapid rises, and nearby named state
   changes are evidence for investigation, not automatic root-cause conclusions.
-- The current version analyzes one log at a time and does not modify the EBEAM
-  dashboard or the original log.
+- The analyzer does not modify the EBEAM dashboard or any original log.
 
 ## Tests and developer checks
 

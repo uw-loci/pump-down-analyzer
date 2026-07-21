@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Extract, analyze, and visualize pressure history from EBEAM dashboard logs.
 
-The command produces CSV files, a native Excel workbook, a factual Markdown
-summary, and a self-contained offline HTML viewer with point/range annotations.
+The command accepts one log or one directory of chained logs and produces CSV
+files, a native Excel workbook, a factual Markdown summary, and a self-contained
+offline HTML viewer with point/range annotations.
 VTRX switch values are decoded immediately into named Boolean equipment states;
 the encoded state value is never written to a public artifact.
 """
@@ -50,6 +51,10 @@ PRESSURE_RE = re.compile(
 )
 STATE_RE = re.compile(r"^VTRX States:\s*(?P<state>[01]{1,8})\s*$")
 DATE_IN_FILENAME_RE = re.compile(r"log_(?P<date>\d{4}-\d{2}-\d{2})(?:_|\b)", re.IGNORECASE)
+CHAIN_LOG_FILENAME_RE = re.compile(
+    r"^log_(?P<date>\d{4}-\d{2}-\d{2})_(?P<clock>\d{2}-\d{2}-\d{2})\.txt$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +66,7 @@ class PressureReading:
     raw_pressure: str
     raw_unit: str
     sample_in_second: int
+    source_log: str
     line_number: int
     quality_flag: str
     states: tuple[Optional[bool], ...]
@@ -75,6 +81,7 @@ class PressureReading:
 class StateSnapshot:
     timestamp: datetime
     states: tuple[bool, ...]
+    source_log: str
     line_number: int
 
 
@@ -85,6 +92,7 @@ class Event:
     message: str
     level: str = "INFO"
     source: str = "Analyzer"
+    source_log: str = ""
     line_number: Optional[int] = None
     end_timestamp: Optional[datetime] = None
     state_name: str = ""
@@ -114,9 +122,20 @@ class Annotation:
     note: str
 
 
+@dataclass(frozen=True)
+class SourceLog:
+    path: Path
+    sha256: str
+    log_start: Optional[datetime]
+    log_end: Optional[datetime]
+    pressure_reading_count: int
+
+
 @dataclass
 class AnalysisResult:
     source_path: Path
+    source_logs: tuple[SourceLog, ...]
+    experiment_name: str
     source_sha256: str
     inferred_date: date
     log_start: datetime
@@ -178,11 +197,60 @@ def infer_log_date(path: Path, explicit_date: Optional[str] = None) -> date:
     return date.fromisoformat(match.group("date"))
 
 
+def _chain_filename_timestamp(path: Path) -> datetime:
+    match = CHAIN_LOG_FILENAME_RE.fullmatch(path.name)
+    if not match:
+        raise ValueError(
+            f"Chained log filename must use log_YYYY-MM-DD_HH-MM-SS.txt: {path.name}"
+        )
+    try:
+        return datetime.strptime(
+            f"{match.group('date')}_{match.group('clock')}", "%Y-%m-%d_%H-%M-%S"
+        )
+    except ValueError as exc:
+        raise ValueError(f"Invalid timestamp in chained log filename: {path.name}") from exc
+
+
+def resolve_input_logs(
+    input_path: Path, explicit_date: Optional[str] = None
+) -> tuple[list[Path], Path, str]:
+    """Resolve one file or one experiment directory into ordered source logs."""
+
+    resolved = input_path.expanduser().resolve()
+    if resolved.is_file():
+        return [resolved], resolved, resolved.stem
+    if not resolved.exists():
+        raise FileNotFoundError(f"Input path not found: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"Input path is neither a file nor a directory: {resolved}")
+    if explicit_date:
+        raise ValueError("--date can only be used when analyzing a single log file")
+
+    candidates = sorted(
+        (path.resolve() for path in resolved.glob("log_*.txt") if path.is_file()),
+        key=lambda path: path.name.lower(),
+    )
+    if not candidates:
+        raise ValueError(f"No non-recursive log_*.txt files were found in {resolved}")
+    ordered = sorted(candidates, key=lambda path: (_chain_filename_timestamp(path), path.name.lower()))
+    return ordered, resolved, resolved.name
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def _source_fingerprint(source_hashes: Sequence[str]) -> str:
+    if len(source_hashes) == 1:
+        return source_hashes[0]
+    digest = hashlib.sha256()
+    digest.update(b"pumpdown-analyzer-chain-v1\0")
+    for source_hash in source_hashes:
+        digest.update(bytes.fromhex(source_hash))
     return digest.hexdigest()
 
 
@@ -221,6 +289,21 @@ def _nearest_pressure(readings: Sequence[PressureReading], timestamp: datetime) 
         return None
     closest = min(candidates, key=lambda item: abs((item.timestamp - timestamp).total_seconds()))
     return closest.pressure_mbar
+
+
+def _nearest_reading(
+    readings: Sequence[PressureReading], timestamp: datetime
+) -> Optional[PressureReading]:
+    if not readings:
+        return None
+    stamps = [item.timestamp for item in readings]
+    position = bisect.bisect_left(stamps, timestamp)
+    candidates = []
+    if position < len(readings):
+        candidates.append(readings[position])
+    if position:
+        candidates.append(readings[position - 1])
+    return min(candidates, key=lambda item: abs((item.timestamp - timestamp).total_seconds()))
 
 
 def _detect_pressure_rises(
@@ -294,7 +377,7 @@ def _load_annotations(path: Optional[Path], expected_hash: str) -> tuple[list[An
     if isinstance(payload, dict):
         supplied_hash = payload.get("source_log_sha256")
         if supplied_hash and supplied_hash != expected_hash:
-            warnings.append("Imported annotations were created for a different source log hash.")
+            warnings.append("Imported annotations were created for a different source fingerprint.")
         records = payload.get("annotations", [])
     elif isinstance(payload, list):
         records = payload
@@ -336,135 +419,196 @@ def parse_log(
     explicit_date: Optional[str] = None,
     annotations_path: Optional[Path] = None,
 ) -> AnalysisResult:
-    log_path = log_path.resolve()
-    if not log_path.is_file():
-        raise FileNotFoundError(f"Log file not found: {log_path}")
-    base_date = infer_log_date(log_path, explicit_date)
-    source_hash = _file_sha256(log_path)
+    resolved = log_path.expanduser().resolve()
+    return parse_logs(
+        [resolved],
+        explicit_date=explicit_date,
+        annotations_path=annotations_path,
+        source_path=resolved,
+        experiment_name=resolved.stem,
+    )
+
+
+def parse_logs(
+    log_paths: Sequence[Path],
+    explicit_date: Optional[str] = None,
+    annotations_path: Optional[Path] = None,
+    source_path: Optional[Path] = None,
+    experiment_name: Optional[str] = None,
+) -> AnalysisResult:
+    paths = [Path(path).expanduser().resolve() for path in log_paths]
+    if not paths:
+        raise ValueError("At least one log file is required")
+    if len(paths) > 1:
+        if explicit_date:
+            raise ValueError("--date can only be used when analyzing a single log file")
+        paths.sort(key=lambda path: (_chain_filename_timestamp(path), path.name.lower()))
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Log file not found: {path}")
+
+    selected_source = (source_path or (paths[0] if len(paths) == 1 else paths[0].parent)).resolve()
+    selected_name = experiment_name or (paths[0].stem if len(paths) == 1 else selected_source.name)
+    base_date = infer_log_date(paths[0], explicit_date)
+    source_hashes = [_file_sha256(path) for path in paths]
+    source_hash = _source_fingerprint(source_hashes)
     annotations, annotation_warnings = _load_annotations(annotations_path, source_hash)
 
     readings: list[PressureReading] = []
     snapshots: list[StateSnapshot] = []
     events: list[Event] = []
+    source_logs: list[SourceLog] = []
     warnings = list(annotation_warnings)
     current_states: Optional[tuple[bool, ...]] = None
     sample_counts: dict[datetime, int] = {}
-    day_offset = 0
-    previous_clock: Optional[time] = None
     log_start: Optional[datetime] = None
     log_end: Optional[datetime] = None
+    previous_source_end: Optional[datetime] = None
     malformed_pressure_count = 0
     malformed_state_count = 0
 
-    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            match = LOG_LINE_RE.match(raw_line.rstrip("\r\n"))
-            if not match:
-                continue
-            clock = time.fromisoformat(match.group("clock"))
-            if previous_clock is not None:
-                prior_seconds = previous_clock.hour * 3600 + previous_clock.minute * 60 + previous_clock.second
-                current_seconds = clock.hour * 3600 + clock.minute * 60 + clock.second
-                if prior_seconds - current_seconds > 12 * 3600:
-                    day_offset += 1
-            previous_clock = clock
-            timestamp = datetime.combine(base_date + timedelta(days=day_offset), clock)
-            log_start = timestamp if log_start is None else log_start
-            log_end = timestamp
-            level = match.group("level")
-            source = match.group("source")
-            message = match.group("message")
+    for log_path, file_hash in zip(paths, source_hashes):
+        file_base_date = infer_log_date(log_path, explicit_date if len(paths) == 1 else None)
+        day_offset = 0
+        previous_clock: Optional[time] = None
+        file_start: Optional[datetime] = None
+        file_end: Optional[datetime] = None
+        reading_count_before = len(readings)
 
-            state_match = STATE_RE.match(message) if source == "VTRX" else None
-            if state_match:
-                try:
-                    new_states = decode_equipment_states(state_match.group("state"))
-                except ValueError:
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                match = LOG_LINE_RE.match(raw_line.rstrip("\r\n"))
+                if not match:
+                    continue
+                clock = time.fromisoformat(match.group("clock"))
+                if previous_clock is not None:
+                    prior_seconds = previous_clock.hour * 3600 + previous_clock.minute * 60 + previous_clock.second
+                    current_seconds = clock.hour * 3600 + clock.minute * 60 + clock.second
+                    if prior_seconds - current_seconds > 12 * 3600:
+                        day_offset += 1
+                previous_clock = clock
+                timestamp = datetime.combine(file_base_date + timedelta(days=day_offset), clock)
+                if file_start is None:
+                    if previous_source_end is not None and timestamp < previous_source_end:
+                        raise ValueError(
+                            f"Chained logs overlap or are out of order: {log_path.name} starts at "
+                            f"{timestamp:%Y-%m-%d %H:%M:%S}, before the preceding log ended at "
+                            f"{previous_source_end:%Y-%m-%d %H:%M:%S}"
+                        )
+                    file_start = timestamp
+                file_end = timestamp
+                log_start = timestamp if log_start is None else log_start
+                log_end = timestamp
+                level = match.group("level")
+                source = match.group("source")
+                message = match.group("message")
+
+                state_match = STATE_RE.match(message) if source == "VTRX" else None
+                if state_match:
+                    try:
+                        new_states = decode_equipment_states(state_match.group("state"))
+                    except ValueError:
+                        malformed_state_count += 1
+                        continue
+                    if current_states is None or new_states != current_states:
+                        snapshots.append(StateSnapshot(timestamp, new_states, log_path.name, line_number))
+                        if current_states is not None:
+                            for index, (old, new) in enumerate(zip(current_states, new_states)):
+                                if old == new:
+                                    continue
+                                action = "Activated" if new else "Deactivated"
+                                state_name = STATE_LABELS[index]
+                                events.append(
+                                    Event(
+                                        timestamp=timestamp,
+                                        category="Equipment state",
+                                        message=f"{state_name} {action.lower()}",
+                                        level="INFO",
+                                        source="VTRX",
+                                        source_log=log_path.name,
+                                        line_number=line_number,
+                                        state_name=state_name,
+                                        action=action,
+                                    )
+                                )
+                        current_states = new_states
+                    continue
+                if source == "VTRX" and message.startswith("VTRX States:"):
                     malformed_state_count += 1
                     continue
-                if current_states is None or new_states != current_states:
-                    snapshots.append(StateSnapshot(timestamp, new_states, line_number))
-                    if current_states is not None:
-                        for index, (old, new) in enumerate(zip(current_states, new_states)):
-                            if old == new:
-                                continue
-                            action = "Activated" if new else "Deactivated"
-                            state_name = STATE_LABELS[index]
-                            events.append(
-                                Event(
-                                    timestamp=timestamp,
-                                    category="Equipment state",
-                                    message=f"{state_name} {action.lower()}",
-                                    level="INFO",
-                                    source="VTRX",
-                                    line_number=line_number,
-                                    state_name=state_name,
-                                    action=action,
-                                )
-                            )
-                    current_states = new_states
-                continue
-            if source == "VTRX" and message.startswith("VTRX States:"):
-                malformed_state_count += 1
-                continue
 
-            pressure_match = PRESSURE_RE.match(message) if source == "VTRX" else None
-            if pressure_match:
-                raw_value = pressure_match.group("value")
-                raw_unit = pressure_match.group("unit")
-                value = float(raw_value)
-                pressure_mbar: Optional[float]
-                if raw_unit.lower() != "mbar":
-                    pressure_mbar = None
-                    quality = f"Unsupported unit: {raw_unit}"
-                elif value <= 0:
-                    pressure_mbar = value
-                    quality = "Nonpositive pressure"
-                elif current_states is None:
-                    pressure_mbar = value
-                    quality = "Missing equipment state"
-                else:
-                    pressure_mbar = value
-                    quality = "OK"
-                sample_in_second = sample_counts.get(timestamp, 0) + 1
-                sample_counts[timestamp] = sample_in_second
-                states: tuple[Optional[bool], ...]
-                states = current_states if current_states is not None else (None,) * len(STATE_LABELS)
-                first_timestamp = readings[0].timestamp if readings else timestamp
-                readings.append(
-                    PressureReading(
-                        sample_index=len(readings) + 1,
-                        timestamp=timestamp,
-                        elapsed_seconds=(timestamp - first_timestamp).total_seconds(),
-                        pressure_mbar=pressure_mbar,
-                        raw_pressure=raw_value,
-                        raw_unit=raw_unit,
-                        sample_in_second=sample_in_second,
-                        line_number=line_number,
-                        quality_flag=quality,
-                        states=states,
+                pressure_match = PRESSURE_RE.match(message) if source == "VTRX" else None
+                if pressure_match:
+                    raw_value = pressure_match.group("value")
+                    raw_unit = pressure_match.group("unit")
+                    value = float(raw_value)
+                    pressure_mbar: Optional[float]
+                    if raw_unit.lower() != "mbar":
+                        pressure_mbar = None
+                        quality = f"Unsupported unit: {raw_unit}"
+                    elif value <= 0:
+                        pressure_mbar = value
+                        quality = "Nonpositive pressure"
+                    elif current_states is None:
+                        pressure_mbar = value
+                        quality = "Missing equipment state"
+                    else:
+                        pressure_mbar = value
+                        quality = "OK"
+                    sample_in_second = sample_counts.get(timestamp, 0) + 1
+                    sample_counts[timestamp] = sample_in_second
+                    states: tuple[Optional[bool], ...]
+                    states = current_states if current_states is not None else (None,) * len(STATE_LABELS)
+                    first_timestamp = readings[0].timestamp if readings else timestamp
+                    readings.append(
+                        PressureReading(
+                            sample_index=len(readings) + 1,
+                            timestamp=timestamp,
+                            elapsed_seconds=(timestamp - first_timestamp).total_seconds(),
+                            pressure_mbar=pressure_mbar,
+                            raw_pressure=raw_value,
+                            raw_unit=raw_unit,
+                            sample_in_second=sample_in_second,
+                            source_log=log_path.name,
+                            line_number=line_number,
+                            quality_flag=quality,
+                            states=states,
+                        )
                     )
-                )
-                continue
-            if source == "VTRX" and message.startswith("GUI updated with pressure:"):
-                malformed_pressure_count += 1
-                continue
+                    continue
+                if source == "VTRX" and message.startswith("GUI updated with pressure:"):
+                    malformed_pressure_count += 1
+                    continue
 
-            category = _classify_relevant_event(source, message)
-            if category:
-                events.append(
-                    Event(
-                        timestamp=timestamp,
-                        category=category,
-                        message=message,
-                        level=level,
-                        source=source,
-                        line_number=line_number,
+                category = _classify_relevant_event(source, message)
+                if category:
+                    events.append(
+                        Event(
+                            timestamp=timestamp,
+                            category=category,
+                            message=message,
+                            level=level,
+                            source=source,
+                            source_log=log_path.name,
+                            line_number=line_number,
+                        )
                     )
-                )
+
+        source_logs.append(
+            SourceLog(
+                path=log_path,
+                sha256=file_hash,
+                log_start=file_start,
+                log_end=file_end,
+                pressure_reading_count=len(readings) - reading_count_before,
+            )
+        )
+        if file_end is not None:
+            previous_source_end = file_end
 
     if not readings:
-        raise ValueError("No pressure readings were found in the log")
+        noun = "log" if len(paths) == 1 else "chained logs"
+        raise ValueError(f"No pressure readings were found in the {noun}")
     if log_start is None or log_end is None:
         raise ValueError("No timestamped log records were found")
     if malformed_pressure_count:
@@ -545,13 +689,19 @@ def parse_log(
 
     for event in events:
         event.pressure_mbar = _nearest_pressure(readings, event.timestamp)
+        if not event.source_log and event.origin != "manual":
+            nearest = _nearest_reading(readings, event.timestamp)
+            if nearest is not None:
+                event.source_log = nearest.source_log
     events.sort(key=lambda item: (item.timestamp, item.category, item.state_name, item.message))
     for index, event in enumerate(events, start=1):
         event.event_id = f"E{index:04d}"
 
     thresholds = _first_decade_crossings(readings)
     return AnalysisResult(
-        source_path=log_path,
+        source_path=selected_source,
+        source_logs=tuple(source_logs),
+        experiment_name=selected_name,
         source_sha256=source_hash,
         inferred_date=base_date,
         log_start=log_start,
@@ -573,11 +723,13 @@ def build_active_state_intervals(result: AnalysisResult) -> list[dict[str, objec
     run_end = result.last_reading.timestamp
     for state_index, state_name in enumerate(STATE_LABELS):
         active_start: Optional[datetime] = None
+        active_source_log = ""
         active_line: Optional[int] = None
         for snapshot in result.state_snapshots:
             active = snapshot.states[state_index]
             if active and active_start is None:
                 active_start = snapshot.timestamp
+                active_source_log = snapshot.source_log
                 active_line = snapshot.line_number
             elif not active and active_start is not None:
                 intervals.append(
@@ -587,10 +739,12 @@ def build_active_state_intervals(result: AnalysisResult) -> list[dict[str, objec
                         "start_timestamp": active_start,
                         "end_timestamp": snapshot.timestamp,
                         "duration_seconds": max(0.0, (snapshot.timestamp - active_start).total_seconds()),
+                        "source_log": active_source_log,
                         "source_line_number": active_line,
                     }
                 )
                 active_start = None
+                active_source_log = ""
                 active_line = None
         if active_start is not None:
             intervals.append(
@@ -600,6 +754,7 @@ def build_active_state_intervals(result: AnalysisResult) -> list[dict[str, objec
                     "start_timestamp": active_start,
                     "end_timestamp": run_end,
                     "duration_seconds": max(0.0, (run_end - active_start).total_seconds()),
+                    "source_log": active_source_log,
                     "source_line_number": active_line,
                 }
             )
@@ -628,6 +783,7 @@ def write_pressure_csv(result: AnalysisResult, output_path: Path) -> None:
         "pressure_raw",
         "unit_raw",
         "sample_in_second",
+        "source_log",
         "log_line_number",
         "quality_flag",
         "active_equipment_states",
@@ -646,6 +802,7 @@ def write_pressure_csv(result: AnalysisResult, output_path: Path) -> None:
                 "pressure_raw": item.raw_pressure,
                 "unit_raw": item.raw_unit,
                 "sample_in_second": item.sample_in_second,
+                "source_log": item.source_log,
                 "log_line_number": item.line_number,
                 "quality_flag": item.quality_flag,
                 "active_equipment_states": item.active_state_summary,
@@ -668,6 +825,7 @@ def write_events_csv(result: AnalysisResult, output_path: Path) -> None:
         "source",
         "message",
         "pressure_mbar_at_event",
+        "source_log",
         "log_line_number",
         "origin",
     ]
@@ -689,6 +847,7 @@ def write_events_csv(result: AnalysisResult, output_path: Path) -> None:
                     "source": event.source,
                     "message": event.message,
                     "pressure_mbar_at_event": _format_pressure(event.pressure_mbar),
+                    "source_log": event.source_log,
                     "log_line_number": event.line_number or "",
                     "origin": event.origin,
                 }
@@ -702,6 +861,7 @@ def write_equipment_csv(result: AnalysisResult, output_path: Path) -> None:
         "equipment_state",
         "status",
         "record_type",
+        "source_log",
         "source_line_number",
     ]
     first = result.first_reading.timestamp
@@ -716,6 +876,7 @@ def write_equipment_csv(result: AnalysisResult, output_path: Path) -> None:
                     "equipment_state": label,
                     "status": "Active" if active else "Inactive",
                     "record_type": "Initial state",
+                    "source_log": initial.source_log,
                     "source_line_number": initial.line_number,
                 }
             )
@@ -729,6 +890,7 @@ def write_equipment_csv(result: AnalysisResult, output_path: Path) -> None:
                 "equipment_state": event.state_name,
                 "status": "Active" if event.action == "Activated" else "Inactive",
                 "record_type": "Transition",
+                "source_log": event.source_log,
                 "source_line_number": event.line_number or "",
             }
         )
@@ -744,19 +906,40 @@ def build_summary_markdown(result: AnalysisResult) -> str:
     lines = [
         "# Pump-Down Anomaly Summary",
         "",
-        f"- Source: `{result.source_path.name}`",
-        f"- Source SHA-256: `{result.source_sha256}`",
+        f"- Experiment: `{result.experiment_name}`",
+        f"- Source logs: {len(result.source_logs):,}",
+        f"- Source fingerprint SHA-256: `{result.source_sha256}`",
         f"- Pressure samples: {len(result.readings):,}",
         f"- Pressure-history span: {_format_duration(result.duration_seconds)} "
         f"({result.first_reading.timestamp:%Y-%m-%d %H:%M:%S} to {result.last_reading.timestamp:%Y-%m-%d %H:%M:%S})",
         f"- Reported pressure range: {minimum.pressure_mbar:.3E} to {maximum.pressure_mbar:.3E} mbar",
         f"- Minimum pressure: {minimum.pressure_mbar:.3E} mbar at {minimum.timestamp:%Y-%m-%d %H:%M:%S}",
         "",
-        "## First readings below decade thresholds",
+        "## Source log manifest",
         "",
-        "| Threshold (mbar) | First timestamp | Reading (mbar) |",
-        "|---:|---|---:|",
+        "| # | Source log | SHA-256 | Log span | Pressure samples |",
+        "|---:|---|---|---|---:|",
     ]
+    for index, source_log in enumerate(result.source_logs, start=1):
+        span = "No timestamped records"
+        if source_log.log_start is not None and source_log.log_end is not None:
+            span = (
+                f"{source_log.log_start:%Y-%m-%d %H:%M:%S} to "
+                f"{source_log.log_end:%Y-%m-%d %H:%M:%S}"
+            )
+        lines.append(
+            f"| {index} | `{source_log.path.name}` | `{source_log.sha256}` | "
+            f"{span} | {source_log.pressure_reading_count:,} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## First readings below decade thresholds",
+            "",
+            "| Threshold (mbar) | First timestamp | Reading (mbar) |",
+            "|---:|---|---:|",
+        ]
+    )
     for threshold, item in result.thresholds:
         lines.append(f"| {threshold:.0E} | {item.timestamp:%Y-%m-%d %H:%M:%S} | {item.pressure_mbar:.3E} |")
 
@@ -842,7 +1025,7 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
             "title": "Pump-Down Pressure Analysis",
             "subject": "Pressure history and decoded equipment-state timeline",
             "author": "Pump-Down Analyzer",
-            "comments": f"Generated from {result.source_path.name}",
+            "comments": f"Generated from {result.experiment_name} ({len(result.source_logs)} source log(s))",
         }
     )
     summary = workbook.add_worksheet("Summary")
@@ -895,6 +1078,7 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
         "Pressure Raw",
         "Unit Raw",
         "Sample In Second",
+        "Source Log",
         "Log Line Number",
         "Quality Flag",
         "Active Equipment States",
@@ -913,10 +1097,11 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
         pressure_sheet.write_string(row_index, 5, item.raw_pressure)
         pressure_sheet.write_string(row_index, 6, item.raw_unit)
         pressure_sheet.write_number(row_index, 7, item.sample_in_second, integer_format)
-        pressure_sheet.write_number(row_index, 8, item.line_number, integer_format)
-        pressure_sheet.write_string(row_index, 9, item.quality_flag)
-        pressure_sheet.write_string(row_index, 10, item.active_state_summary)
-        for offset, state in enumerate(item.states, start=11):
+        pressure_sheet.write_string(row_index, 8, item.source_log)
+        pressure_sheet.write_number(row_index, 9, item.line_number, integer_format)
+        pressure_sheet.write_string(row_index, 10, item.quality_flag)
+        pressure_sheet.write_string(row_index, 11, item.active_state_summary)
+        for offset, state in enumerate(item.states, start=12):
             if state is None:
                 pressure_sheet.write_blank(row_index, offset, None)
             else:
@@ -939,19 +1124,19 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
     pressure_sheet.set_column(1, 1, 21, timestamp_format)
     pressure_sheet.set_column(2, 3, 15)
     pressure_sheet.set_column(4, 4, 16, pressure_format)
-    pressure_sheet.set_column(5, 9, 17)
-    pressure_sheet.set_column(10, 10, 54)
-    pressure_sheet.set_column(11, pressure_last_col, 19)
+    pressure_sheet.set_column(5, 10, 17)
+    pressure_sheet.set_column(11, 11, 54)
+    pressure_sheet.set_column(12, pressure_last_col, 19)
     pressure_sheet.set_row(0, 34)
-    state_range = (1, 11, pressure_last_row, pressure_last_col)
+    state_range = (1, 12, pressure_last_row, pressure_last_col)
     pressure_sheet.conditional_format(*state_range, {"type": "text", "criteria": "containing", "value": "TRUE", "format": bool_active})
     pressure_sheet.conditional_format(*state_range, {"type": "text", "criteria": "containing", "value": "FALSE", "format": bool_inactive})
-    pressure_sheet.conditional_format(1, 9, pressure_last_row, 9, {"type": "text", "criteria": "not containing", "value": "OK", "format": warning_format})
+    pressure_sheet.conditional_format(1, 10, pressure_last_row, 10, {"type": "text", "criteria": "not containing", "value": "OK", "format": warning_format})
 
     # Equipment States: transition history plus active intervals.
-    transition_headers = ["Timestamp Local", "Elapsed Seconds", "Equipment State", "Status", "Log Line Number"]
+    transition_headers = ["Timestamp Local", "Elapsed Seconds", "Equipment State", "Status", "Source Log", "Log Line Number"]
     equipment_sheet.write_row(0, 0, transition_headers, header_format)
-    transition_rows: list[tuple[datetime, float, str, str, int]] = []
+    transition_rows: list[tuple[datetime, float, str, str, str, int]] = []
     if result.state_snapshots:
         first_snapshot = result.state_snapshots[0]
         for label, active in zip(STATE_LABELS, first_snapshot.states):
@@ -961,6 +1146,7 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
                     (first_snapshot.timestamp - result.first_reading.timestamp).total_seconds(),
                     label,
                     "Active" if active else "Inactive",
+                    first_snapshot.source_log,
                     first_snapshot.line_number,
                 )
             )
@@ -972,6 +1158,7 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
                     (event.timestamp - result.first_reading.timestamp).total_seconds(),
                     event.state_name,
                     "Active" if event.action == "Activated" else "Inactive",
+                    event.source_log,
                     event.line_number or 0,
                 )
             )
@@ -980,7 +1167,8 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
         equipment_sheet.write_number(row_index, 1, row[1], integer_format)
         equipment_sheet.write_string(row_index, 2, row[2])
         equipment_sheet.write_string(row_index, 3, row[3])
-        equipment_sheet.write_number(row_index, 4, row[4], integer_format)
+        equipment_sheet.write_string(row_index, 4, row[4])
+        equipment_sheet.write_number(row_index, 5, row[5], integer_format)
     if transition_rows:
         equipment_sheet.add_table(
             0,
@@ -992,7 +1180,7 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
         equipment_sheet.conditional_format(1, 3, len(transition_rows), 3, {"type": "text", "criteria": "containing", "value": "Active", "format": bool_active})
         equipment_sheet.conditional_format(1, 3, len(transition_rows), 3, {"type": "text", "criteria": "containing", "value": "Inactive", "format": bool_inactive})
 
-    interval_headers = ["Equipment State", "Start Timestamp", "End Timestamp", "Duration Seconds", "Source Log Line"]
+    interval_headers = ["Equipment State", "Start Timestamp", "End Timestamp", "Duration Seconds", "Source Log", "Source Log Line"]
     equipment_sheet.write_row(0, 7, interval_headers, header_format)
     intervals = build_active_state_intervals(result)
     for row_index, interval in enumerate(intervals, start=1):
@@ -1000,23 +1188,24 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
         equipment_sheet.write_datetime(row_index, 8, interval["start_timestamp"], timestamp_format)
         equipment_sheet.write_datetime(row_index, 9, interval["end_timestamp"], timestamp_format)
         equipment_sheet.write_number(row_index, 10, float(interval["duration_seconds"]), integer_format)
-        equipment_sheet.write_number(row_index, 11, int(interval["source_line_number"]), integer_format)
+        equipment_sheet.write_string(row_index, 11, str(interval["source_log"]))
+        equipment_sheet.write_number(row_index, 12, int(interval["source_line_number"]), integer_format)
     if intervals:
         equipment_sheet.add_table(
             0,
             7,
             len(intervals),
-            11,
+            12,
             {"name": "ActiveStateIntervalsTable", "style": "Table Style Medium 4", "columns": [{"header": item} for item in interval_headers]},
         )
     equipment_sheet.freeze_panes(1, 0)
     equipment_sheet.set_column(0, 1, 21)
     equipment_sheet.set_column(2, 3, 24)
-    equipment_sheet.set_column(4, 4, 16)
-    equipment_sheet.set_column(5, 6, 3)
+    equipment_sheet.set_column(4, 5, 28)
+    equipment_sheet.set_column(6, 6, 3)
     equipment_sheet.set_column(7, 7, 24)
     equipment_sheet.set_column(8, 9, 21)
-    equipment_sheet.set_column(10, 11, 17)
+    equipment_sheet.set_column(10, 12, 20)
     equipment_sheet.set_row(0, 34)
 
     # Events and manual notes.
@@ -1032,6 +1221,7 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
         "Source",
         "Message",
         "Pressure at Event (mbar)",
+        "Source Log",
         "Log Line Number",
         "Origin",
     ]
@@ -1052,9 +1242,11 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
         events_sheet.write_string(row_index, 9, event.message)
         if event.pressure_mbar is not None:
             events_sheet.write_number(row_index, 10, event.pressure_mbar, pressure_format)
+        if event.source_log:
+            events_sheet.write_string(row_index, 11, event.source_log)
         if event.line_number is not None:
-            events_sheet.write_number(row_index, 11, event.line_number, integer_format)
-        events_sheet.write_string(row_index, 12, event.origin)
+            events_sheet.write_number(row_index, 12, event.line_number, integer_format)
+        events_sheet.write_string(row_index, 13, event.origin)
     if result.events:
         events_sheet.add_table(
             0,
@@ -1073,7 +1265,7 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
     events_sheet.set_column(5, 6, 24)
     events_sheet.set_column(7, 8, 18)
     events_sheet.set_column(9, 9, 68)
-    events_sheet.set_column(10, 12, 19)
+    events_sheet.set_column(10, 13, 21)
     events_sheet.set_row(0, 34)
 
     # Chart helper range preserves source-row lineage and extremes when sampling.
@@ -1103,12 +1295,12 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
     summary.merge_range("A1:N2", "Pump-Down Pressure Analysis", title_format)
     summary.set_row(0, 28)
     summary.set_row(1, 12)
-    summary.write("A4", "Source log", label_format)
-    summary.write("B4", result.source_path.name, text_format)
-    summary.write("A5", "Log SHA-256", label_format)
-    summary.write("B5", result.source_sha256, text_format)
-    summary.write("A6", "Date source", label_format)
-    summary.write("B6", f"Inferred from filename: {result.inferred_date.isoformat()}", text_format)
+    summary.write("A4", "Experiment", label_format)
+    summary.write("B4", result.experiment_name, text_format)
+    summary.write("A5", "Source log count", label_format)
+    summary.write_number("B5", len(result.source_logs), integer_format)
+    summary.write("A6", "Source fingerprint", label_format)
+    summary.write("B6", result.source_sha256, text_format)
 
     summary.write("A8", "Run metrics", section_format)
     summary.merge_range("A8:D8", "Run metrics", section_format)
@@ -1183,9 +1375,28 @@ def write_workbook(result: AnalysisResult, output_path: Path) -> None:
     ]
     for offset, note in enumerate(notes, start=note_row + 1):
         summary.merge_range(offset, 0, offset, 4, f"• {note}", text_format)
+    manifest_row = note_row + len(notes) + 2
+    summary.merge_range(manifest_row, 0, manifest_row, 5, "Ordered source log manifest", section_format)
+    summary.write_row(
+        manifest_row + 1,
+        0,
+        ["#", "Source Log", "SHA-256", "Log Start", "Log End", "Pressure Samples"],
+        header_format,
+    )
+    for index, source_log in enumerate(result.source_logs, start=1):
+        row = manifest_row + 1 + index
+        summary.write_number(row, 0, index, integer_format)
+        summary.write_string(row, 1, source_log.path.name)
+        summary.write_string(row, 2, source_log.sha256)
+        if source_log.log_start is not None:
+            summary.write_datetime(row, 3, source_log.log_start, timestamp_format)
+        if source_log.log_end is not None:
+            summary.write_datetime(row, 4, source_log.log_end, timestamp_format)
+        summary.write_number(row, 5, source_log.pressure_reading_count, integer_format)
     summary.set_column("A:A", 25)
-    summary.set_column("B:B", 23)
-    summary.set_column("C:E", 18)
+    summary.set_column("B:B", 34)
+    summary.set_column("C:C", 68)
+    summary.set_column("D:E", 21)
     summary.set_column("F:F", 70)
     summary.set_column("G:I", 3)
     summary.set_column("J:N", 14)
@@ -1234,7 +1445,7 @@ def build_viewer_payload(result: AnalysisResult, summary_markdown: str) -> dict[
         if item.pressure_mbar is not None and item.pressure_mbar > 0
     ]
     sample_meta = [
-        [item.sample_in_second, item.line_number, item.quality_flag]
+        [item.sample_in_second, item.source_log, item.line_number, item.quality_flag]
         for item in result.readings
         if item.pressure_mbar is not None and item.pressure_mbar > 0
     ]
@@ -1251,6 +1462,7 @@ def build_viewer_payload(result: AnalysisResult, summary_markdown: str) -> dict[
             round((event.timestamp - first).total_seconds(), 3),
             STATE_LABELS.index(event.state_name),
             1 if event.action == "Activated" else 0,
+            event.source_log,
             event.line_number,
         ]
         for event in result.events
@@ -1268,6 +1480,7 @@ def build_viewer_payload(result: AnalysisResult, summary_markdown: str) -> dict[
             "source": event.source,
             "message": event.message,
             "pressure": event.pressure_mbar,
+            "source_log": event.source_log,
             "line": event.line_number,
             "origin": event.origin,
         }
@@ -1275,10 +1488,24 @@ def build_viewer_payload(result: AnalysisResult, summary_markdown: str) -> dict[
         if event.origin != "manual"
     ]
     return {
-        "schema_version": 1,
-        "source_name": result.source_path.name,
-        "source_stem": result.source_path.stem,
+        "schema_version": 2,
+        "source_name": result.experiment_name,
+        "source_stem": result.experiment_name,
         "source_log_sha256": result.source_sha256,
+        "source_logs": [
+            {
+                "name": source_log.path.name,
+                "sha256": source_log.sha256,
+                "log_start_timestamp_local": (
+                    source_log.log_start.isoformat(timespec="seconds") if source_log.log_start else None
+                ),
+                "log_end_timestamp_local": (
+                    source_log.log_end.isoformat(timespec="seconds") if source_log.log_end else None
+                ),
+                "pressure_reading_count": source_log.pressure_reading_count,
+            }
+            for source_log in result.source_logs
+        ],
         "start_timestamp_local": first.isoformat(timespec="seconds"),
         "end_timestamp_local": result.last_reading.timestamp.isoformat(timespec="seconds"),
         "duration_seconds": result.duration_seconds,
@@ -1289,6 +1516,11 @@ def build_viewer_payload(result: AnalysisResult, summary_markdown: str) -> dict[
         "readings": readings,
         "sample_meta": sample_meta,
         "state_names": list(STATE_LABELS),
+        "initial_state_source": (
+            [result.state_snapshots[0].source_log, result.state_snapshots[0].line_number]
+            if result.state_snapshots
+            else ["", None]
+        ),
         "active_state_intervals": intervals,
         "state_changes": state_changes,
         "events": events,
@@ -1347,13 +1579,20 @@ def _check_targets(targets: Iterable[Path], overwrite: bool) -> None:
 
 
 def run_analysis(args: argparse.Namespace) -> dict[str, Path]:
-    log_path = Path(args.input_log).expanduser()
+    input_path = Path(args.input_log).expanduser()
+    log_paths, source_path, experiment_name = resolve_input_logs(input_path, explicit_date=args.date)
     annotations_path = Path(args.annotations).expanduser() if args.annotations else None
-    result = parse_log(log_path, explicit_date=args.date, annotations_path=annotations_path)
-    output_dir = Path(args.out).expanduser() if args.out else Path("outputs") / log_path.stem
+    result = parse_logs(
+        log_paths,
+        explicit_date=args.date,
+        annotations_path=annotations_path,
+        source_path=source_path,
+        experiment_name=experiment_name,
+    )
+    output_dir = Path(args.out).expanduser() if args.out else Path("outputs") / experiment_name
     output_dir = output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = log_path.stem
+    stem = experiment_name
     paths = {
         "pressure_csv": output_dir / f"{stem}_pressure.csv",
         "events_csv": output_dir / f"{stem}_events.csv",
@@ -1374,7 +1613,7 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Path]:
         raise FileNotFoundError(f"Viewer template not found beside the script: {template_path}")
     write_viewer(result, paths["viewer"], template_path, summary_markdown)
 
-    print(f"Processed {len(result.readings):,} pressure readings.")
+    print(f"Processed {len(result.readings):,} pressure readings from {len(result.source_logs):,} source log(s).")
     print(
         f"Minimum: {result.minimum_reading.pressure_mbar:.3E} mbar at "
         f"{result.minimum_reading.timestamp:%Y-%m-%d %H:%M:%S}"
@@ -1390,23 +1629,25 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Path]:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Extract pump-down pressure history, decoded equipment states, Excel analysis, and an offline viewer.",
+        description="Extract pump-down pressure history, decoded equipment states, Excel analysis, and an offline viewer from one log or one directory of chained logs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python pumpdown_analyzer.py inputs/log_2026-08-03_09-15-00.txt
+  python pumpdown_analyzer.py "inputs/2026-07-21 pump down"
   python pumpdown_analyzer.py D:/pump-logs/run-17.txt --date 2026-08-03
   python pumpdown_analyzer.py run.txt --out D:/analyses/run-17 --overwrite
 
-The default output directory is ./outputs/<log-stem>, relative to the current
-working directory. The input log is never modified.
+For a directory, non-recursive log_YYYY-MM-DD_HH-MM-SS.txt files are chained as
+one experiment. The default output directory is ./outputs/<input-name>, relative
+to the current working directory. Input logs are never modified.
 """,
     )
-    parser.add_argument("input_log", help="Dashboard log file to analyze")
+    parser.add_argument("input_log", help="Dashboard log file or chained-experiment directory to analyze")
     parser.add_argument(
         "--out",
-        help="Output directory (default: ./outputs/<log-stem> relative to the current working directory)",
+        help="Output directory (default: ./outputs/<input-name> relative to the current working directory)",
     )
-    parser.add_argument("--date", help="Override/inject log date as YYYY-MM-DD")
+    parser.add_argument("--date", help="Override/inject a single log file date as YYYY-MM-DD")
     parser.add_argument("--annotations", help="Annotation JSON exported by the viewer")
     parser.add_argument("--overwrite", action="store_true", help="Replace generated output files if they already exist")
     return parser
