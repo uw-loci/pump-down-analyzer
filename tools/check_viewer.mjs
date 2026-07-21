@@ -15,6 +15,15 @@ if (scripts.length !== 3) {
 const data = JSON.parse(scripts[0]);
 JSON.parse(scripts[1]);
 new Function(scripts[2]);
+if (/Math\.(?:min|max)\(\.\.\./.test(scripts[2])) {
+  throw new Error("Viewer uses spread extrema, which fails for large pressure series");
+}
+if (!Array.isArray(data.source_logs) || data.source_logs.length < 1) {
+  throw new Error("Viewer payload is missing its source log manifest");
+}
+if (data.sample_meta.some((row) => !Array.isArray(row) || row.length < 4)) {
+  throw new Error("Viewer sample metadata is missing source-log provenance");
+}
 console.log(
   JSON.stringify({
     scripts: scripts.length,
@@ -23,5 +32,6 @@ console.log(
     states: data.state_names.length,
     intervals: data.active_state_intervals.length,
     changes: data.state_changes.length,
+    sourceLogs: data.source_logs.length,
   }),
 );

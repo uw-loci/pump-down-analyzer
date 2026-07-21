@@ -404,18 +404,23 @@
       if (view.x0 < 0 || span >= duration) { view.x0 = 0; view.x1 = duration; }
     }
 
-    function visibleReadings() {
+    function visibleReadingBounds() {
       const start = Math.max(0, lowerBound(view.x0) - 1);
       const end = Math.min(DATA.readings.length, lowerBound(view.x1) + 1);
-      return DATA.readings.slice(start, end).map((row, offset) => ({ row, index: start + offset }));
+      return { start, end };
     }
 
     function sampledVisibleReadings() {
-      const visible = visibleReadings();
+      const { start, end } = visibleReadingBounds();
       const limit = Math.max(800, Math.floor(PLOT_WIDTH * 2));
-      if (visible.length <= limit) return visible;
+      if (end - start <= limit) {
+        const visible = [];
+        for (let index = start; index < end; index++) visible.push({ row: DATA.readings[index], index });
+        return visible;
+      }
       const buckets = new Map();
-      for (const item of visible) {
+      for (let index = start; index < end; index++) {
+        const item = { row: DATA.readings[index], index };
         const pixel = Math.max(0, Math.min(Math.floor(PLOT_WIDTH), Math.floor(xFor(item.row[0]) - LEFT)));
         let bucket = buckets.get(pixel);
         if (!bucket) {
@@ -435,9 +440,22 @@
     }
 
     function calculateY() {
-      const visible = visibleReadings().map(item => item.row[1]).filter(value => Number.isFinite(value) && value > 0);
-      const values = visible.length ? visible : DATA.readings.map(row => row[1]).filter(value => value > 0);
-      let min = Math.min(...values), max = Math.max(...values);
+      const { start, end } = visibleReadingBounds();
+      let min = Infinity, max = -Infinity;
+      for (let index = start; index < end; index++) {
+        const value = Number(DATA.readings[index][1]);
+        if (!Number.isFinite(value) || value <= 0) continue;
+        if (value < min) min = value;
+        if (value > max) max = value;
+      }
+      if (!Number.isFinite(min) || !Number.isFinite(max)) {
+        for (const row of DATA.readings) {
+          const value = Number(row[1]);
+          if (!Number.isFinite(value) || value <= 0) continue;
+          if (value < min) min = value;
+          if (value > max) max = value;
+        }
+      }
       if (view.scale === "log") {
         let lo = Math.floor(Math.log10(min));
         let hi = Math.ceil(Math.log10(max));
@@ -730,6 +748,7 @@
         schema_version: 1,
         source_name: DATA.source_name,
         source_log_sha256: DATA.source_log_sha256,
+        source_logs: DATA.source_logs || [],
         exported_at: new Date().toISOString(),
         annotations,
       };
@@ -766,7 +785,7 @@
         const payload = JSON.parse(await file.text());
         const records = Array.isArray(payload) ? payload : payload.annotations;
         if (!Array.isArray(records)) throw new Error("No annotations array found");
-        if (payload.source_log_sha256 && payload.source_log_sha256 !== DATA.source_log_sha256 && !confirm("These notes were created for a different log. Import anyway?")) return;
+        if (payload.source_log_sha256 && payload.source_log_sha256 !== DATA.source_log_sha256 && !confirm("These notes were created for a different source experiment. Import anyway?")) return;
         annotations = records.map((item, index) => ({
           id: String(item.id || item.annotation_id || `imported-${index + 1}`),
           kind: item.kind === "range" ? "range" : "point",
@@ -788,31 +807,32 @@
     function csvLine(values) { return values.map(csvCell).join(",") + "\r\n"; }
 
     function buildPressureCsv() {
-      const headers = ["sample_index", "timestamp_local", "elapsed_seconds", "pressure_mbar", "sample_in_second", "log_line_number", "quality_flag", "active_equipment_states", ...DATA.state_names];
+      const headers = ["sample_index", "timestamp_local", "elapsed_seconds", "pressure_mbar", "sample_in_second", "source_log", "log_line_number", "quality_flag", "active_equipment_states", ...DATA.state_names];
       let text = csvLine(headers);
       DATA.readings.forEach((row, index) => {
-        const [elapsed, pressure] = row, meta = DATA.sample_meta[index] || ["", "", ""];
+        const [elapsed, pressure] = row, meta = DATA.sample_meta[index] || ["", "", "", ""];
         const active = activeStateIndexesAt(elapsed);
         const labels = [...active].map(stateIndex => DATA.state_names[stateIndex]);
-        text += csvLine([index + 1, isoAt(elapsed), elapsed, formatPressure(pressure), meta[0], meta[1], meta[2], labels.join("; "), ...DATA.state_names.map((_, stateIndex) => active.has(stateIndex) ? "TRUE" : "FALSE")]);
+        text += csvLine([index + 1, isoAt(elapsed), elapsed, formatPressure(pressure), meta[0], meta[1], meta[2], meta[3], labels.join("; "), ...DATA.state_names.map((_, stateIndex) => active.has(stateIndex) ? "TRUE" : "FALSE")]);
       });
       return text;
     }
 
     function buildEquipmentCsv() {
-      let text = csvLine(["timestamp_local", "elapsed_seconds", "equipment_state", "status", "record_type", "source_line_number"]);
+      let text = csvLine(["timestamp_local", "elapsed_seconds", "equipment_state", "status", "record_type", "source_log", "source_line_number"]);
       const initial = activeStateIndexesAt(0);
-      DATA.state_names.forEach((name, index) => { text += csvLine([isoAt(0), 0, name, initial.has(index) ? "Active" : "Inactive", "Initial state", ""]); });
-      DATA.state_changes.forEach(([elapsed, stateIndex, active, line]) => { text += csvLine([isoAt(elapsed), elapsed, DATA.state_names[stateIndex], active ? "Active" : "Inactive", "Transition", line || ""]); });
+      const initialSource = DATA.initial_state_source || ["", ""];
+      DATA.state_names.forEach((name, index) => { text += csvLine([isoAt(0), 0, name, initial.has(index) ? "Active" : "Inactive", "Initial state", initialSource[0], initialSource[1] || ""]); });
+      DATA.state_changes.forEach(([elapsed, stateIndex, active, sourceLog, line]) => { text += csvLine([isoAt(elapsed), elapsed, DATA.state_names[stateIndex], active ? "Active" : "Inactive", "Transition", sourceLog, line || ""]); });
       return text;
     }
 
     function buildEventsCsv() {
-      let text = csvLine(["event_id", "timestamp_local", "end_timestamp_local", "elapsed_seconds", "category", "equipment_state", "action", "level", "source", "message", "pressure_mbar_at_event", "log_line_number", "origin"]);
-      DATA.events.forEach(event => { text += csvLine([event.id, isoAt(event.t), event.t1 === null ? "" : isoAt(event.t1), event.t, event.category, event.state, event.action, event.level, event.source, event.message, formatPressure(event.pressure), event.line || "", event.origin]); });
+      let text = csvLine(["event_id", "timestamp_local", "end_timestamp_local", "elapsed_seconds", "category", "equipment_state", "action", "level", "source", "message", "pressure_mbar_at_event", "source_log", "log_line_number", "origin"]);
+      DATA.events.forEach(event => { text += csvLine([event.id, isoAt(event.t), event.t1 === null ? "" : isoAt(event.t1), event.t, event.category, event.state, event.action, event.level, event.source, event.message, formatPressure(event.pressure), event.source_log || "", event.line || "", event.origin]); });
       annotations.forEach((item, index) => {
         const elapsed = elapsedFromIso(item.start_timestamp_local), nearest = nearestReading(elapsed);
-        text += csvLine([`N${index + 1}`, item.start_timestamp_local, item.end_timestamp_local || "", elapsed, item.category, "", "", "NOTE", "Manual annotation", item.note, nearest ? formatPressure(nearest.row[1]) : "", "", "manual"]);
+        text += csvLine([`N${index + 1}`, item.start_timestamp_local, item.end_timestamp_local || "", elapsed, item.category, "", "", "NOTE", "Manual annotation", item.note, nearest ? formatPressure(nearest.row[1]) : "", "", "", "manual"]);
       });
       return text;
     }
@@ -920,7 +940,7 @@
       } finally { button.disabled = false; }
     });
 
-    document.getElementById("source-name").textContent = DATA.source_name;
+    document.getElementById("source-name").textContent = `${DATA.source_name} • ${(DATA.source_logs || []).length} source log${(DATA.source_logs || []).length === 1 ? "" : "s"}`;
     document.getElementById("sample-count").textContent = Number(DATA.reading_count).toLocaleString();
     document.getElementById("minimum-pressure").textContent = `${formatPressure(DATA.minimum_pressure_mbar)} mbar`;
     document.getElementById("history-span").textContent = formatElapsed(DATA.duration_seconds);
